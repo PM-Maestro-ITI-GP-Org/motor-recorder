@@ -81,10 +81,25 @@ int mqtt_client_init(mqtt_client_t *m, cmd_callback_t cb)
 
 int mqtt_client_connect(mqtt_client_t *m)
 {
+    /*
+     * mosquitto_connect_async() is called here only to record the broker
+     * host/port in the client. On this QNX libmosquitto build the async
+     * connect path is broken: for any connection that does not complete
+     * synchronously it reports "Socket is not connected" (ENOTCONN). We
+     * therefore ignore its return value and let the network thread started
+     * below do the actual connecting.
+     *
+     * mosquitto_loop_start() runs mosquitto_loop_forever() in the
+     * background, which automatically reconnects with the delay/backoff set
+     * by mosquitto_reconnect_delay_set() in mqtt_client_init() and uses the
+     * working blocking mosquitto_reconnect() path. on_connect() re-subscribes
+     * and re-publishes status once connected, so the recorder keeps retrying
+     * in the background until the broker becomes reachable.
+     */
     int rc = mosquitto_connect_async(m->mosq, MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE);
     if (rc != MOSQ_ERR_SUCCESS) {
-        fprintf(stderr, "[MQTT] Connection failed: %s\n", mosquitto_strerror(rc));
-        return -1;
+        fprintf(stderr, "[MQTT] Initial async connect: %s (ignoring, retrying in background)\n",
+                mosquitto_strerror(rc));
     }
 
     rc = mosquitto_loop_start(m->mosq);
@@ -94,7 +109,7 @@ int mqtt_client_connect(mqtt_client_t *m)
         return -1;
     }
 
-    printf("[MQTT] Connecting to %s:%d (async, will retry until connected)\n",
+    printf("[MQTT] Connecting to %s:%d (background, retrying until connected)\n",
            MQTT_BROKER, MQTT_PORT);
     return 0;
 }
