@@ -36,13 +36,19 @@ struct mqtt_client {
     uint64_t last_data_ts;
     cmd_callback_t cmd_callback;
     volatile bool connected;
+    volatile bool connecting;
     volatile bool reconnect_enabled;
+    uint64_t connect_attempt_ms;
+    uint64_t last_kick_ms;
 };
 
 int mqtt_client_init(mqtt_client_t *m, cmd_callback_t cb);
 int mqtt_client_connect(mqtt_client_t *m);
 int mqtt_client_subscribe(mqtt_client_t *m);
 void mqtt_client_disconnect(mqtt_client_t *m);
+/* Poll this from the main loop: kicks a reconnect whenever the client is not
+   connected and no attempt is in flight. Safe to call repeatedly. */
+void mqtt_client_ensure_connected(mqtt_client_t *m);
 void mqtt_client_publish_status(mqtt_client_t *m, rec_state_t state, const char *msg);
 void mqtt_client_publish_row(mqtt_client_t *m, uint64_t ts, const motor_row_t *row);
 void mqtt_client_publish_chunk(mqtt_client_t *m, int chunk_idx, int total_chunks,

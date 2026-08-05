@@ -90,7 +90,7 @@ static void row_buf_add(struct row_buf *b, uint64_t ts, const motor_row_t *row);
 static void row_buf_flush(FILE *f, struct row_buf *b);
 static void *reader_thread(void *arg);
 static void *writer_thread(void *arg);
-static shm_state_t *shm_connect(void);
+static shm_state_t *shm_try_connect(void);
 static void shm_disconnect(shm_state_t *s);
 static size_t shm_poll(shm_state_t *s, shm_block_t *out, size_t max_blocks);
 static FILE *open_csv(const char *path);
@@ -122,6 +122,13 @@ static bool g_uploading = false;
 
 static uint64_t g_auto_stop_time = 0;
 static bool g_auto_stop_active = false;
+
+/* Waiting for the data producer (SHM /motor_ctrl) to come up so a queued
+   "start" can actually begin. While set, incoming commands get a
+   "producer is off (no data)" reply. */
+static bool g_waiting_for_producer = false;
+static char g_pending_filename[1024] = "";
+static uint64_t g_pending_duration = 0;
 
 static uint64_t now_ms(void)
 {
@@ -277,36 +284,26 @@ static void *writer_thread(void *arg)
 
 /* ======== SHM ======== */
 
-static shm_state_t *shm_connect(void)
+/* Non-blocking: returns a live region if the producer (SHM /motor_ctrl) is
+   already up, otherwise NULL without waiting. Polled from the main loop so a
+   "start" issued before the producer is running waits until it appears. */
+static shm_state_t *shm_try_connect(void)
 {
     shm_state_t *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
 
     const shm_region_t *r = (const shm_region_t *)MAP_FAILED;
-    for (int tries = 0; tries < 100 && r == MAP_FAILED; ++tries) {
-        int fd = shm_open(MOTOR_SHM_NAME, O_RDONLY, 0);
-        if (fd != -1) {
-            r = (const shm_region_t *)mmap(NULL, sizeof(shm_region_t),
-                                            PROT_READ, MAP_SHARED, fd, 0);
-            close(fd);
-        }
-        if (r == MAP_FAILED) {
-            struct timespec d = {0, 100 * 1000 * 1000L};
-            nanosleep(&d, NULL);
-        }
+    int fd = shm_open(MOTOR_SHM_NAME, O_RDONLY, 0);
+    if (fd != -1) {
+        r = (const shm_region_t *)mmap(NULL, sizeof(shm_region_t),
+                                       PROT_READ, MAP_SHARED, fd, 0);
+        close(fd);
     }
-    if (r == MAP_FAILED) { free(s); return NULL; }
-
-    for (int tries = 0; tries < 100 && !motor_shm_region_valid(r); ++tries) {
-        struct timespec d = {0, 50 * 1000 * 1000L};
-        nanosleep(&d, NULL);
-    }
-    if (!motor_shm_region_valid(r)) {
-        munmap((void *)r, sizeof(shm_region_t));
+    if (r == MAP_FAILED || !motor_shm_region_valid(r)) {
+        if (r != MAP_FAILED) munmap((void *)r, sizeof(shm_region_t));
         free(s);
         return NULL;
     }
-
     s->region = r;
     return s;
 }
@@ -348,8 +345,8 @@ static FILE *open_csv(const char *path)
 {
     FILE *f = fopen(path, "w");
     if (!f) { perror("fopen"); return NULL; }
-    fprintf(f, "timestamp,current_0,current_1,current_2,current_3,"
-               "current_4,current_5,current_6,current_7,"
+    fprintf(f, "timestamp,Current_0,Current_1,Current_2,Speed_volt_cmd,"
+               "Volt_0,Volt_1,Volt_2,DC_bus_volt,"
                "vib_x,vib_y,vib_z,rpm\n");
     return f;
 }
@@ -383,13 +380,14 @@ static void recorder_cleanup(void)
     g_rec_rows = 0;
 }
 
-static void start_recording_internal(const char *filename)
+static void finish_start_recording(const char *filename, uint64_t duration_sec)
 {
     snprintf(g_csv_filename, sizeof(g_csv_filename), "%s", filename);
 
     g_csv_file = open_csv(filename);
     if (!g_csv_file) {
         fprintf(stderr, "[cmd] Failed to open CSV file: %s\n", filename);
+        shm_disconnect(g_shm); g_shm = NULL;
         g_csv_filename[0] = '\0';
         return;
     }
@@ -397,17 +395,9 @@ static void start_recording_internal(const char *filename)
     g_queue = queue_alloc(18);
     if (!g_queue) {
         fclose(g_csv_file); g_csv_file = NULL;
+        shm_disconnect(g_shm); g_shm = NULL;
         g_csv_filename[0] = '\0';
         fprintf(stderr, "[cmd] Failed to allocate queue\n");
-        return;
-    }
-
-    g_shm = shm_connect();
-    if (!g_shm) {
-        queue_free(g_queue); g_queue = NULL;
-        fclose(g_csv_file); g_csv_file = NULL;
-        g_csv_filename[0] = '\0';
-        fprintf(stderr, "[cmd] Failed to connect to SHM\n");
         return;
     }
 
@@ -442,6 +432,39 @@ static void start_recording_internal(const char *filename)
 
     fprintf(stderr, "[cmd] Recording to %s (PID: %d)\n", filename, getpid());
     mqtt_client_publish_status(g_mqtt, REC_STATE_RECORDING, filename);
+
+    if (duration_sec > 0) {
+        g_auto_stop_time = now_ms() + duration_sec * 1000ULL;
+        g_auto_stop_active = true;
+        fprintf(stderr, "[cmd] Auto-stop at %llu ms (in %llu sec)\n",
+                (unsigned long long)g_auto_stop_time,
+                (unsigned long long)duration_sec);
+    }
+}
+
+/* Returns 1 if recording started now, 0 if waiting for the producer. */
+static int start_recording_or_wait(const char *filename, uint64_t duration_sec)
+{
+    if (g_waiting_for_producer) {
+        snprintf(g_pending_filename, sizeof(g_pending_filename), "%s", filename);
+        g_pending_duration = duration_sec;
+        fprintf(stderr, "[cmd] Still waiting for data producer; updated pending start\n");
+        return 0;
+    }
+
+    g_shm = shm_try_connect();
+    if (!g_shm) {
+        snprintf(g_pending_filename, sizeof(g_pending_filename), "%s", filename);
+        g_pending_duration = duration_sec;
+        g_waiting_for_producer = true;
+        fprintf(stderr, "[cmd] Data producer not running (no /motor_ctrl); waiting for it...\n");
+        mqtt_client_publish_status(g_mqtt, REC_STATE_IDLE,
+                                   "waiting for data producer (no data)");
+        return 0;
+    }
+
+    finish_start_recording(filename, duration_sec);
+    return 1;
 }
 
 /* ======== Stop recording (extracted for reuse) ======== */
@@ -608,6 +631,15 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
 {
     g_mqtt = m;
 
+    /* While we're still waiting for the data producer (SHM /motor_ctrl), any
+       command other than "start" is answered with a producer-off notice. */
+    if (g_waiting_for_producer && strncmp(cmd, "start", 5) != 0) {
+        fprintf(stderr, "[cmd] Command '%s' ignored: data producer is off\n", cmd);
+        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+            "{\"state\":\"error\",\"msg\":\"producer is off (no data)\"}");
+        return;
+    }
+
     if (strncmp(cmd, "start", 5) == 0) {
         if (g_recording) {
             fprintf(stderr, "[cmd] Already recording\n");
@@ -645,15 +677,7 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
         fprintf(stderr, "[cmd] Starting recording... file=%s dur=%llu\n",
                 filename, (unsigned long long)duration_sec);
 
-        start_recording_internal(filename);
-
-        if (duration_sec > 0) {
-            g_auto_stop_time = now_ms() + duration_sec * 1000ULL;
-            g_auto_stop_active = true;
-            fprintf(stderr, "[cmd] Auto-stop at %llu ms (in %llu sec)\n",
-                    (unsigned long long)g_auto_stop_time,
-                    (unsigned long long)duration_sec);
-        }
+        start_recording_or_wait(filename, duration_sec);
     }
     else if (strcmp(cmd, "stop") == 0) {
         stop_recording();
@@ -892,6 +916,19 @@ int main(int argc, char *argv[])
     while (g_running) {
         struct timespec ts = {0, 100 * 1000 * 1000L};
         nanosleep(&ts, NULL);
+        mqtt_client_ensure_connected(&mqtt);
+        if (g_waiting_for_producer && !g_recording) {
+            g_shm = shm_try_connect();
+            if (g_shm) {
+                g_waiting_for_producer = false;
+                fprintf(stderr, "[main] Data producer online; starting recording now\n");
+                char name[1024];
+                uint64_t dur = g_pending_duration;
+                snprintf(name, sizeof(name), "%s", g_pending_filename);
+                g_pending_filename[0] = '\0';
+                finish_start_recording(name, dur);
+            }
+        }
         if (g_auto_stop_active && g_recording && now_ms() >= g_auto_stop_time) {
             fprintf(stderr, "[main] Auto-stop triggered\n");
             stop_recording();

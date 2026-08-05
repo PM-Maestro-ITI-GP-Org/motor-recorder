@@ -7,6 +7,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
+
+/* wall-clock milliseconds, for throttling reconnect attempts */
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000u);
+}
 
 static void cmd_callback(struct mosquitto *mosq, void *userdata,
                         const struct mosquitto_message *msg)
@@ -29,6 +38,8 @@ static void on_connect(struct mosquitto *mosq, void *userdata, int rc)
 
     if (rc == 0) {
         m->connected = true;
+        m->connecting = false;
+        m->connect_attempt_ms = 0;
         printf("[MQTT] Connected to broker\n");
         mosquitto_subscribe(m->mosq, NULL, CMD_TOPIC, 0);
         char status_buf[512];
@@ -41,6 +52,7 @@ static void on_connect(struct mosquitto *mosq, void *userdata, int rc)
             mosquitto_publish(m->mosq, NULL, STATUS_TOPIC, len, status_buf, 0, false);
     } else {
         m->connected = false;
+        m->connecting = false;
         fprintf(stderr, "[MQTT] Connect failed (rc=%d, %s)\n", rc, mosquitto_strerror(rc));
     }
 }
@@ -50,6 +62,7 @@ static void on_disconnect(struct mosquitto *mosq, void *userdata, int rc)
     (void)mosq;
     mqtt_client_t *m = (mqtt_client_t *)userdata;
     m->connected = false;
+    m->connecting = false;
     fprintf(stderr, "[MQTT] Disconnected (rc=%d) — will retry\n", rc);
 }
 
@@ -57,6 +70,8 @@ int mqtt_client_init(mqtt_client_t *m, cmd_callback_t cb)
 {
     memset(m, 0, sizeof(*m));
     m->cmd_callback = cb;
+
+    mosquitto_lib_init();
 
     m->mosq = mosquitto_new("motor_recorder", true, m);
     if (!m->mosq) {
@@ -74,6 +89,9 @@ int mqtt_client_init(mqtt_client_t *m, cmd_callback_t cb)
     snprintf(m->status_msg, sizeof(m->status_msg), "idle");
     m->last_data_ts = 0;
     m->connected = false;
+    m->connecting = false;
+    m->connect_attempt_ms = 0;
+    m->last_kick_ms = 0;
     m->reconnect_enabled = true;
 
     return 0;
@@ -114,6 +132,52 @@ int mqtt_client_connect(mqtt_client_t *m)
     return 0;
 }
 
+/*
+ * Polled from the recorder's main loop. Reliably reclaims the connection
+ * whenever it drops:
+ *  - Mosquitto's own loop thread reconnects on its own on most builds, but on
+ *    this QNX build that path has already proven unreliable (the async connect
+ *    bug above), so we kick it explicitly.
+ *  - If an attempt is already in flight (connecting), we do nothing — but we
+ *    also watchdog it: a syscall-level failure that never fires the connect/
+ *    disconnect callbacks would otherwise leave connecting stuck forever, so
+ *    after 15 s we force the flag clear and let the next poll re-kick.
+ */
+void mqtt_client_ensure_connected(mqtt_client_t *m)
+{
+    uint64_t now = now_ms();
+
+    if (!m->mosq || m->connected || !m->reconnect_enabled)
+        return;
+
+    if (m->connecting) {
+        if (m->connect_attempt_ms && now - m->connect_attempt_ms > 15000)
+            m->connecting = false;
+        else
+            return;
+    }
+
+    /* Never kick more often than once per 2 s. */
+    if (now - m->last_kick_ms < 2000)
+        return;
+    m->last_kick_ms = now;
+
+    m->connecting = true;
+    m->connect_attempt_ms = now;
+
+    int rc = mosquitto_reconnect_async(m->mosq);
+    if (rc == MOSQ_ERR_SUCCESS || rc == MOSQ_ERR_CONN_PENDING) {
+        printf("[MQTT] Retrying connection to %s:%d\n", MQTT_BROKER, MQTT_PORT);
+        return;
+    }
+
+    m->connecting = false;
+    m->connect_attempt_ms = 0;
+    if (rc != MOSQ_ERR_NO_CONN)
+        fprintf(stderr, "[MQTT] Reconnect attempt failed: %s\n",
+                mosquitto_strerror(rc));
+}
+
 int mqtt_client_subscribe(mqtt_client_t *m)
 {
     if (mosquitto_subscribe(m->mosq, NULL, CMD_TOPIC, 0) != MOSQ_ERR_SUCCESS) {
@@ -129,12 +193,14 @@ void mqtt_client_disconnect(mqtt_client_t *m)
 {
     m->reconnect_enabled = false;
     m->connected = false;
+    m->connecting = false;
     if (m->mosq) {
         mosquitto_loop_stop(m->mosq, true);
         mosquitto_disconnect(m->mosq);
         mosquitto_destroy(m->mosq);
         m->mosq = NULL;
     }
+    mosquitto_lib_cleanup();
 }
 
 void mqtt_client_publish_status(mqtt_client_t *m, rec_state_t state, const char *msg)
