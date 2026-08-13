@@ -20,20 +20,44 @@ static uint64_t now_ms(void)
 static void cmd_callback(struct mosquitto *mosq, void *userdata,
                         const struct mosquitto_message *msg)
 {
+    (void)mosq;
     mqtt_client_t *m = (mqtt_client_t *)userdata;
-    const char *topic = msg->topic;
-    const char *payload = (const char *)msg->payload;
-    int payload_len = msg->payloadlen;
 
-    printf("[MQTT] Received cmd: %.*s on topic %s\n", payload_len, payload, topic);
+    /*
+     * Copied into a buffer we terminate ourselves, rather than handed straight
+     * to the command parser.
+     *
+     * Two reasons, and the first is a remote crash. An MQTT message may have a
+     * zero-length payload, and libmosquitto reports that as payload == NULL --
+     * which went directly to handle_command(), whose very first act is
+     * strncmp(cmd, "start", 5). Publishing an empty message to the command
+     * topic was enough to segfault the recorder.
+     *
+     * Second, a payload is a byte buffer with a length, not a C string. This
+     * build of libmosquitto does append a terminator as a convenience, but the
+     * parser below runs strcmp/strncmp/sscanf over it, so depending on that is
+     * depending on a courtesy rather than on the protocol.
+     */
+    char cmd[512];
+    int n = msg->payloadlen;
+    if (n < 0) n = 0;
+    if (n >= (int)sizeof(cmd)) n = (int)sizeof(cmd) - 1;
+    if (n > 0 && msg->payload)
+        memcpy(cmd, msg->payload, (size_t)n);
+    else
+        n = 0;
+    cmd[n] = '\0';
 
-    if (m->cmd_callback) {
-        m->cmd_callback(m, payload);
-    }
+    printf("[MQTT] Received cmd: %s on topic %s\n",
+           cmd, msg->topic ? msg->topic : "(none)");
+
+    if (m->cmd_callback)
+        m->cmd_callback(m, cmd);
 }
 
 static void on_connect(struct mosquitto *mosq, void *userdata, int rc)
 {
+    (void)mosq;
     mqtt_client_t *m = (mqtt_client_t *)userdata;
 
     if (rc == 0) {
@@ -203,19 +227,63 @@ void mqtt_client_disconnect(mqtt_client_t *m)
     mosquitto_lib_cleanup();
 }
 
+/*
+ * Escape a string for a JSON double-quoted value. Always terminates.
+ *
+ * Messages published from here are filenames and error text, both of which can
+ * contain a quote or a backslash -- `start <name>` takes the name straight from
+ * the command. Pasted in raw they produced a payload the GUI's JSON.parse()
+ * rejected, so the reply was dropped whole instead of being shown wrong.
+ */
+static void json_escape_str(const char *in, char *out, size_t out_sz)
+{
+    size_t j = 0;
+    if (out_sz == 0) return;
+    for (size_t i = 0; in && in[i] && j + 8 < out_sz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        switch (c) {
+        case '"':  out[j++] = '\\'; out[j++] = '"';  break;
+        case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
+        case '\n': out[j++] = '\\'; out[j++] = 'n';  break;
+        case '\r': out[j++] = '\\'; out[j++] = 'r';  break;
+        case '\t': out[j++] = '\\'; out[j++] = 't';  break;
+        default:
+            if (c < 0x20) j += (size_t)snprintf(out + j, out_sz - j, "\\u%04x", c);
+            else          out[j++] = (char)c;
+        }
+    }
+    out[j] = '\0';
+}
+
 void mqtt_client_publish_status(mqtt_client_t *m, rec_state_t state, const char *msg)
 {
+    if (!msg) msg = "";
     m->state = state;
-    snprintf(m->status_msg, sizeof(m->status_msg), msg);
+
+    /*
+     * "%s", msg -- not msg.
+     *
+     * This was snprintf(m->status_msg, sizeof(m->status_msg), msg), which hands
+     * the caller's string to printf as the FORMAT. msg is a filename here, and
+     * filenames come from `start <name>` over MQTT, so `start %s%s%s` walked
+     * varargs that were never pushed and `start %n` was a write through one.
+     * A format string is never the right place for data.
+     */
+    snprintf(m->status_msg, sizeof(m->status_msg), "%s", msg);
+
+    char esc[300];
+    json_escape_str(msg, esc, sizeof(esc));
 
     char status_buf[512];
     int len = snprintf(status_buf, sizeof(status_buf),
-                      "{\"state\":\"%s\",\"msg\":\"%s\"}", 
+                      "{\"state\":\"%s\",\"msg\":\"%s\"}",
                       (state == REC_STATE_IDLE) ? "idle" :
                       (state == REC_STATE_RECORDING) ? "recording" : "stopped",
-                      msg);
+                      esc);
 
-    if (len > 0 && len < sizeof(status_buf)) {
+    /* (size_t)len, so a truncating snprintf -- which returns the length it
+       WOULD have written -- cannot compare as "fits" against a signed int. */
+    if (len > 0 && (size_t)len < sizeof(status_buf)) {
         mosquitto_publish(m->mosq, NULL, STATUS_TOPIC, len, status_buf, 0, false);
     }
 }
@@ -230,7 +298,7 @@ void mqtt_client_publish_row(mqtt_client_t *m, uint64_t ts, const motor_row_t *r
                       row->current[4], row->current[5], row->current[6], row->current[7],
                       row->vib_x, row->vib_y, row->vib_z, row->rpm);
 
-    if (len > 0 && len < sizeof(row_buf)) {
+    if (len > 0 && (size_t)len < sizeof(row_buf)) {
         mosquitto_publish(m->mosq, NULL, DATA_TOPIC, len, row_buf, 0, false);
     }
 
@@ -244,7 +312,16 @@ void mqtt_client_publish_chunk(mqtt_client_t *m, int chunk_idx, int total_chunks
     int pos = snprintf(chunk_buf, sizeof(chunk_buf),
                       "{\"chunk\":%d,\"total\":%d,\"data\":\"",
                       chunk_idx, total_chunks);
-    for (size_t i = 0; i < chunk_len && pos < (int)sizeof(chunk_buf) - 6; ++i) {
+    /*
+     * -8, not -6.
+     *
+     * The widest escape below writes 6 bytes, so -6 kept the loop itself in
+     * bounds -- but it could leave pos with only two bytes spare, too few for
+     * the closing "\"}" and its terminator. Reserving the tail here means the
+     * close below can be unconditional, which is what the bug underneath it
+     * needed.
+     */
+    for (size_t i = 0; i < chunk_len && pos < (int)sizeof(chunk_buf) - 8; ++i) {
         unsigned char c = (unsigned char)chunk_data[i];
         if (c == '"' || c == '\\') {
             chunk_buf[pos++] = '\\';
@@ -265,13 +342,21 @@ void mqtt_client_publish_chunk(mqtt_client_t *m, int chunk_idx, int total_chunks
             chunk_buf[pos++] = c;
         }
     }
-    if (pos < (int)sizeof(chunk_buf) - 3)
-        memcpy(chunk_buf + pos, "\"}", 3);
-    else
-        chunk_buf[pos] = '\0';
+    /*
+     * Closing the object is unconditional now, because the length below is.
+     *
+     * It used to be conditional -- and when the condition failed it wrote only
+     * a terminator, no "\"}" -- while `len = pos + 2` was computed either way.
+     * So on that path the publish claimed two bytes that had never been
+     * written: the payload was unterminated JSON, which the GUI drops, with two
+     * bytes of whatever was on the stack appended to it. Rare, since it needs a
+     * chunk that escapes to nearly 8 KB, but it leaked stack either way.
+     *
+     * The loop above reserves the room, so this always fits.
+     */
+    memcpy(chunk_buf + pos, "\"}", 3);
     int len = pos + 2;
-    if (len > 0)
-        mosquitto_publish(m->mosq, NULL, DOWNLOAD_TOPIC, len, chunk_buf, 0, false);
+    mosquitto_publish(m->mosq, NULL, DOWNLOAD_TOPIC, len, chunk_buf, 0, false);
 }
 
 void mqtt_client_publish_upload_progress(mqtt_client_t *m, int percent)
@@ -284,7 +369,7 @@ void mqtt_client_publish_upload_progress(mqtt_client_t *m, int percent)
                       "{\"state\":\"uploading\",\"progress\":%d}",
                       percent);
 
-    if (len > 0 && len < sizeof(buf)) {
+    if (len > 0 && (size_t)len < sizeof(buf)) {
         mosquitto_publish(m->mosq, NULL, STATUS_TOPIC, len, buf, 0, false);
     }
 }
@@ -295,8 +380,19 @@ void mqtt_client_publish_stop_metadata(mqtt_client_t *m, const char *file,
                                         uint64_t drops, uint64_t block_drops,
                                         uint64_t stalled_ms)
 {
+    if (!file) file = "";
+    if (!url)  url  = "";     /* *url below dereferenced this unchecked */
+
     m->state = REC_STATE_STOPPED;
     snprintf(m->status_msg, sizeof(m->status_msg), "%s", file);
+
+    /* Both are escaped: `file` is a recording name, and those come from
+       `start <name>` over MQTT, so a quote in one used to produce a payload the
+       GUI could not parse -- losing the entire end-of-recording report,
+       including the row and drop counts, rather than just the name. */
+    char file_esc[600], url_esc[600];
+    json_escape_str(file, file_esc, sizeof(file_esc));
+    json_escape_str(url,  url_esc,  sizeof(url_esc));
 
     char buf[1536];
     int len = snprintf(buf, sizeof(buf),
@@ -311,14 +407,14 @@ void mqtt_client_publish_stop_metadata(mqtt_client_t *m, const char *file,
                       "\"block_drops\":%llu,"
                       "\"stalled_ms\":%llu"
                       "}",
-                      file, *url ? url : "",
+                      file_esc, url_esc,
                       (unsigned long long)span_us,
                       (unsigned long long)rows,
                       (unsigned long long)drops,
                       (unsigned long long)block_drops,
                       (unsigned long long)stalled_ms);
 
-    if (len > 0 && len < sizeof(buf)) {
+    if (len > 0 && (size_t)len < sizeof(buf)) {
         mosquitto_publish(m->mosq, NULL, STATUS_TOPIC, len, buf, 0, false);
     }
 }

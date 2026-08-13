@@ -137,6 +137,78 @@ static uint64_t now_ms(void)
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
+/* ======== Filenames arriving over MQTT ======== */
+
+/*
+ * Turn a filename from a command into a path inside g_save_dir, or refuse.
+ *
+ * Every one of these names arrives over MQTT, and the broker credentials are
+ * compiled into this repository, so "whoever can reach the broker" is the
+ * threat model whether or not that was intended. Before this, `delete` pasted
+ * the name straight into "%s/%s" -- so `delete ../../etc/passwd` resolved
+ * wherever the ".." took it -- and `download` was worse: it looked for a '/'
+ * and, finding one, used the argument as an absolute path verbatim, which made
+ * `download /etc/shadow` a supported way to read any file on the guest out over
+ * MQTT.
+ *
+ * A recording filename is a single directory entry by construction
+ * (generate_filename produces one, and the list command only ever reports
+ * one), so requiring exactly that costs nothing and ends the whole class:
+ * no separators, no "..", no leading dot, no empty name.
+ *
+ * Returns 0 on success.
+ */
+static int resolve_in_save_dir(const char *name, char *out, size_t out_sz)
+{
+    if (!name || !*name) return -1;
+    if (strchr(name, '/') || strchr(name, '\\')) return -1;
+    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return -1;
+    if (name[0] == '.') return -1;              /* no dotfiles, no "..foo" */
+    if (strlen(name) > 255) return -1;
+
+    int n = snprintf(out, out_sz, "%s/%s", g_save_dir, name);
+    if (n < 0 || (size_t)n >= out_sz) return -1;
+    return 0;
+}
+
+/*
+ * Escape a string for embedding in a JSON double-quoted value.
+ *
+ * Filenames were pasted in raw. One containing a quote or a backslash -- which
+ * nothing prevents, since `start <name>` takes the name from the command --
+ * produced a payload the GUI's JSON.parse() rejected, and the reply was
+ * dropped whole rather than being shown wrong. Returns the number of bytes
+ * written, and always terminates.
+ */
+static size_t json_escape(const char *in, char *out, size_t out_sz)
+{
+    size_t j = 0;
+    if (out_sz == 0) return 0;
+    for (size_t i = 0; in && in[i] && j + 8 < out_sz; i++) {
+        unsigned char c = (unsigned char)in[i];
+        switch (c) {
+        case '"':  out[j++] = '\\'; out[j++] = '"';  break;
+        case '\\': out[j++] = '\\'; out[j++] = '\\'; break;
+        case '\n': out[j++] = '\\'; out[j++] = 'n';  break;
+        case '\r': out[j++] = '\\'; out[j++] = 'r';  break;
+        case '\t': out[j++] = '\\'; out[j++] = 't';  break;
+        default:
+            if (c < 0x20) j += (size_t)snprintf(out + j, out_sz - j, "\\u%04x", c);
+            else          out[j++] = (char)c;
+        }
+    }
+    out[j] = '\0';
+    return j;
+}
+
+/* Does `name` end in ".csv"? strstr() matched the extension anywhere, so
+   "run.csv.bak" and "notes.csvx" were both listed as recordings. */
+static bool has_csv_suffix(const char *name)
+{
+    size_t n = strlen(name);
+    return n > 4 && strcmp(name + n - 4, ".csv") == 0;
+}
+
 /* ======== Queue ======== */
 
 static row_queue_t *queue_alloc(uint32_t power_of_two)
@@ -559,69 +631,104 @@ static void handle_list_command(void)
 
     struct dirent *entry;
     char json[4096];
-    int pos = snprintf(json, sizeof(json),
-                       "{\"state\":\"file_list\",\"files\":[");
+    size_t pos = (size_t)snprintf(json, sizeof(json),
+                                  "{\"state\":\"file_list\",\"files\":[");
     bool first = true;
+
+    /*
+     * Each entry is built whole and only then committed.
+     *
+     * The separator used to be written before the entry was known to fit, and
+     * with two independent size checks that disagreed. So a directory big
+     * enough to fill this buffer produced either "},{" with the comma dropped
+     * and no separator at all, or a trailing "," right before the "]" -- both
+     * of which are invalid JSON, and the GUI drops a list it cannot parse
+     * rather than showing the files that did fit. Reserve 3 bytes throughout
+     * for the closing "]}" and the terminator, so closing it can never fail.
+     */
     while ((entry = readdir(d)) != NULL) {
-        if (strstr(entry->d_name, ".csv") != NULL) {
-            char fullpath[1024];
-            snprintf(fullpath, sizeof(fullpath), "%s/%s", g_save_dir, entry->d_name);
-            struct stat st;
-            long fsize = 0;
-            if (stat(fullpath, &st) == 0)
-                fsize = st.st_size;
-            if (!first && pos < (int)sizeof(json) - 64) {
-                json[pos++] = ',';
-            }
-            int n = snprintf(json + pos, sizeof(json) - pos,
-                            "{\"name\":\"%s\",\"size\":%ld}",
-                            entry->d_name, fsize);
-            if (n > 0 && pos + n < (int)sizeof(json)) {
-                pos += n;
-                first = false;
-            }
-        }
+        if (!has_csv_suffix(entry->d_name))
+            continue;
+
+        char fullpath[1024];
+        if (resolve_in_save_dir(entry->d_name, fullpath, sizeof(fullpath)) != 0)
+            continue;                      /* readdir gave us something odd */
+
+        struct stat st;
+        long fsize = 0;
+        if (stat(fullpath, &st) == 0)
+            fsize = (long)st.st_size;
+
+        char esc[600];
+        json_escape(entry->d_name, esc, sizeof(esc));
+
+        char item[768];
+        int n = snprintf(item, sizeof(item),
+                         "%s{\"name\":\"%s\",\"size\":%ld}",
+                         first ? "" : ",", esc, fsize);
+        if (n < 0 || (size_t)n >= sizeof(item))
+            continue;
+        if (pos + (size_t)n + 3 > sizeof(json))
+            break;                         /* no room: stop cleanly, stay valid */
+
+        memcpy(json + pos, item, (size_t)n);
+        pos += (size_t)n;
+        first = false;
     }
     closedir(d);
 
-    if (pos < (int)sizeof(json) - 3)
-        memcpy(json + pos, "]}", 3);
-    else
-        json[sizeof(json) - 1] = '\0';
+    memcpy(json + pos, "]}", 3);
 
     fprintf(stderr, "[cmd] File list response\n");
     mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, json);
 }
 
+static void delete_reply(const char *filename, bool ok)
+{
+    char esc[600];
+    json_escape(filename, esc, sizeof(esc));
+
+    char resp[768];
+    snprintf(resp, sizeof(resp),
+             "{\"state\":\"delete_result\",\"file\":\"%s\",\"success\":%s}",
+             esc, ok ? "true" : "false");
+    mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, resp);
+}
+
 static void handle_delete_command(const char *filename)
 {
     char fullpath[1024];
-    snprintf(fullpath, sizeof(fullpath), "%s/%s", g_save_dir, filename);
+
+    /* Refused before it reaches the filesystem: this used to build the path by
+       pasting the name into "%s/%s", so `delete ../../<anything>` removed
+       whatever it resolved to. */
+    if (resolve_in_save_dir(filename, fullpath, sizeof(fullpath)) != 0) {
+        fprintf(stderr, "[cmd] Rejected delete of '%s' (not a plain name in %s)\n",
+                filename, g_save_dir);
+        delete_reply(filename, false);
+        return;
+    }
+
+    /* Only recordings. Nothing else in the save dir is this command's business,
+       and the GUI never asks for anything else. */
+    if (!has_csv_suffix(filename)) {
+        fprintf(stderr, "[cmd] Rejected delete of '%s' (not a .csv)\n", filename);
+        delete_reply(filename, false);
+        return;
+    }
 
     if (access(fullpath, F_OK) != 0) {
         fprintf(stderr, "[cmd] File not found for delete: %s\n", fullpath);
-        char resp[512];
-        snprintf(resp, sizeof(resp),
-                "{\"state\":\"delete_result\",\"file\":\"%s\",\"success\":false}",
-                filename);
-        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, resp);
+        delete_reply(filename, false);
         return;
     }
 
     if (remove(fullpath) == 0) {
         fprintf(stderr, "[cmd] Deleted: %s\n", fullpath);
-        char resp[512];
-        snprintf(resp, sizeof(resp),
-                "{\"state\":\"delete_result\",\"file\":\"%s\",\"success\":true}",
-                filename);
-        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, resp);
+        delete_reply(filename, true);
     } else {
         fprintf(stderr, "[cmd] Failed to delete: %s\n", fullpath);
-        char resp[512];
-        snprintf(resp, sizeof(resp),
-                "{\"state\":\"delete_result\",\"file\":\"%s\",\"success\":false}",
-                filename);
-        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, resp);
+        delete_reply(filename, false);
     }
 }
 
@@ -655,13 +762,32 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
         if (*arg == '\0') {
             generate_filename(filename, sizeof(filename));
         } else {
+            /*
+             * %199s, not %255s. The buffer is 200 bytes and the conversion was
+             * allowed to write 255 characters plus a terminator into it -- a
+             * 56-byte stack overflow reachable by publishing a long enough
+             * `start <name>` to the broker. The width and the buffer have to
+             * be stated together or they drift; they are one line apart now.
+             */
             char name_buf[200];
             int n = 0;
-            if (sscanf(arg, "%255s%n", name_buf, &n) >= 1) {
+            if (sscanf(arg, "%199s%n", name_buf, &n) >= 1) {
                 if (name_buf[0] >= '0' && name_buf[0] <= '9') {
                     duration_sec = strtoull(name_buf, NULL, 10);
                     generate_filename(filename, sizeof(filename));
                 } else {
+                    /* The name becomes "<save_dir>/<name>.csv", so a name
+                       carrying a separator wrote the recording outside the save
+                       directory -- the same hole as delete and download, just
+                       creating instead of destroying. */
+                    if (strchr(name_buf, '/') || strchr(name_buf, '\\')
+                        || name_buf[0] == '.') {
+                        fprintf(stderr, "[cmd] Rejected start name '%s' "
+                                        "(must be a plain name)\n", name_buf);
+                        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+                            "{\"state\":\"error\",\"msg\":\"invalid recording name\"}");
+                        return;
+                    }
                     snprintf(filename, sizeof(filename), "%s/%s.csv", g_save_dir, name_buf);
                     arg += n;
                     while (*arg == ' ') arg++;
@@ -836,8 +962,13 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
         const char *arg = cmd + 8;
         while (*arg == ' ') arg++;
 
+        /* No argument means "the recording just made". g_csv_filename holds a
+           full path (generate_filename builds one), so reduce it to the plain
+           name the containment check below expects -- it is in g_save_dir by
+           construction, which is exactly what that check is enforcing. */
         if (*arg == '\0' && g_csv_filename[0] != '\0') {
-            arg = g_csv_filename;
+            const char *slash = strrchr(g_csv_filename, '/');
+            arg = slash ? slash + 1 : g_csv_filename;
         }
 
         if (*arg == '\0') {
@@ -845,11 +976,23 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
             return;
         }
 
-        char filepath[2048];
-        if (strchr(arg, '/'))
-            snprintf(filepath, sizeof(filepath), "%s", arg);
-        else
-            snprintf(filepath, sizeof(filepath), "%s/%s", g_save_dir, arg);
+        /*
+         * The old form of this was, verbatim:
+         *
+         *     if (strchr(arg, '/')) snprintf(filepath, ..., "%s", arg);
+         *
+         * -- a '/' anywhere in the argument meant "treat it as an absolute
+         * path and read it". So `download /etc/shadow` streamed any readable
+         * file on the guest out over MQTT, to anyone able to publish to a
+         * broker whose credentials are compiled into this repository. The
+         * default local save name still works; a path does not.
+         */
+        char filepath[1024];
+        if (resolve_in_save_dir(arg, filepath, sizeof(filepath)) != 0) {
+            fprintf(stderr, "[cmd] Rejected download of '%s' (not a plain name in %s)\n",
+                    arg, g_save_dir);
+            return;
+        }
 
         if (access(filepath, F_OK) != 0) {
             fprintf(stderr, "[cmd] File not found: %s\n", filepath);
