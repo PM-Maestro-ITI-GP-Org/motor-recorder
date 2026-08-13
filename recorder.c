@@ -322,11 +322,24 @@ static void *reader_thread(void *arg)
     return NULL;
 }
 
+/*
+ * How often a sample row is published for the GUI's live display.
+ *
+ * The rows themselves arrive far faster than this -- the producer streams a
+ * block at a time off SPI -- and every one of them still goes to the CSV. This
+ * governs only the copy sent over MQTT, which exists to drive a panel a person
+ * is looking at. Ten a second is past the point where a number on screen reads
+ * as anything but a blur, and publishing every row instead would put thousands
+ * of messages a second onto a broker roughly 145ms away.
+ */
+#define LIVE_ROW_INTERVAL_MS 100
+
 static void *writer_thread(void *arg)
 {
     pin_to_cpu(1);
     writer_t *w = (writer_t *)arg;
     struct row_buf buf = { .len = 0 };
+    uint64_t last_pub_ms = 0;
 
     while (g_running && g_recording && w->active) {
         csv_row_t cr;
@@ -337,6 +350,23 @@ static void *writer_thread(void *arg)
                 (*w->rec_rows_ptr)++;
                 pthread_mutex_unlock(&g_rec_mutex);
             }
+
+            /*
+             * Publish a sample for the live display.
+             *
+             * mqtt_client_publish_row() existed, was declared in the header,
+             * and was called from nowhere at all -- so the recorder wrote every
+             * row to disk and sent not one of them to the GUI. The GUI has had
+             * a handler for the data topic the whole time, splitting the 13
+             * fields this publishes; it simply never received anything, which
+             * is why the live panel sat at "---" throughout a recording.
+             */
+            uint64_t now = now_ms();
+            if (g_mqtt && now - last_pub_ms >= LIVE_ROW_INTERVAL_MS) {
+                last_pub_ms = now;
+                mqtt_client_publish_row(g_mqtt, cr.ts, &cr.row);
+            }
+
             if (buf.len >= ROW_BUF_SIZE / 2)
                 row_buf_flush(w->csv_file, &buf);
         } else {
@@ -871,7 +901,6 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
                 remote_user, remote_dir);
 
         char stat_buf[64];
-        int ssh_stat_cmd_initialized = 0;
 
         fprintf(stderr, "[cmd] Uploading file via SCP... (%lld bytes)\n", local_size);
         fflush(stderr);
@@ -894,31 +923,48 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
             time_t now = time(NULL);
             int elapsed_seconds = (int)(now - last_progress_time);
 
-            // Only send progress every 10 seconds (not 5, to reduce SSH load)
-            // or if we haven't sent any progress in 30 seconds
-            if ((elapsed_seconds >= 10 && last_pct < 100) || (elapsed_seconds >= 30 && progress_updates_sent == 0)) {
-                if (ssh_stat_cmd_initialized) {
-                    FILE *fp = popen(ssh_stat_cmd, "r");
-                    if (fp) {
-                        if (fgets(stat_buf, sizeof(stat_buf), fp)) {
-                            long long current_remote_size = atoll(stat_buf);
-                            if (current_remote_size > 0 && local_size > 0) {
-                                int pct = (int)(current_remote_size * 100 / local_size);
-                                if (pct > 100) pct = 100;
-                                if (pct > last_pct) {
-                                    last_pct = pct;
-                                    progress_updates_sent++;
-                                    fprintf(stderr, "[SCP DEBUG] Progress: %lld / %lld bytes (%d%%)\n",
-                                            current_remote_size, local_size, pct);
-                                    mqtt_client_publish_upload_progress(g_mqtt, pct);
-                                    last_progress_time = now;
-                                }
+            /*
+             * Poll how much of the file has landed on the server.
+             *
+             * This whole block used to be wrapped in `if
+             * (ssh_stat_cmd_initialized)`, a local that was set to 0 at its
+             * declaration and never assigned anywhere else -- so the condition
+             * was always false and not one intermediate percentage was ever
+             * published. The only progress the GUI ever saw was the hardcoded
+             * 100 after scp returned, which is exactly why the bar jumped
+             * straight from 0 to 100. ssh_stat_cmd is built unconditionally
+             * above, so there was nothing for the flag to guard.
+             *
+             * Every 3s rather than 10s: each poll is an ssh round trip, so it
+             * cannot be tight, but 10s on a short upload produced one update
+             * at most -- which looks the same as none.
+             */
+            if (elapsed_seconds >= 3 && last_pct < 100) {
+                last_progress_time = now;      /* whether or not it answers */
+
+                FILE *fp = popen(ssh_stat_cmd, "r");
+                if (fp) {
+                    if (fgets(stat_buf, sizeof(stat_buf), fp)) {
+                        long long current_remote_size = atoll(stat_buf);
+                        if (current_remote_size > 0 && local_size > 0) {
+                            int pct = (int)(current_remote_size * 100 / local_size);
+                            if (pct > 100) pct = 100;
+                            /* 99 max here: 100 is published once, after scp is
+                               known to have succeeded. A file can be fully
+                               written and the transfer still fail. */
+                            if (pct > 99) pct = 99;
+                            if (pct > last_pct) {
+                                last_pct = pct;
+                                progress_updates_sent++;
+                                fprintf(stderr, "[SCP] progress %lld / %lld bytes (%d%%)\n",
+                                        current_remote_size, local_size, pct);
+                                mqtt_client_publish_upload_progress(g_mqtt, pct);
                             }
                         }
-                        pclose(fp);
-                    } else {
-                        fprintf(stderr, "[SCP DEBUG] Failed to execute ssh stat command\n");
                     }
+                    pclose(fp);
+                } else {
+                    fprintf(stderr, "[SCP] could not run the remote stat\n");
                 }
             }
 
