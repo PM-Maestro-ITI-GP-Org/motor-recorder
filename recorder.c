@@ -886,104 +886,131 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
 
         char remote_user[] = "maxmaster@139.185.38.211";
 
-        char scp_cmd[4096];
-        snprintf(scp_cmd, sizeof(scp_cmd),
-                "scp -C -o ConnectTimeout=30 -o StrictHostKeyChecking=no "
+        /*
+         * The file is streamed through ssh rather than handed to scp, so that
+         * progress comes from bytes this process has actually written.
+         *
+         * What was here before could not report progress at all, for three
+         * separate reasons stacked on top of each other:
+         *
+         *   - scp ran in a forked child and the parent watched it with
+         *     waitpid(WNOHANG) in a loop whose only other statement was
+         *     mqtt_client_loop(), which is a no-op on this build (the network
+         *     runs on mosquitto's own thread). So the loop had no sleep in it
+         *     at all: it spun at 100% CPU on a guest with ONE vCPU, competing
+         *     with the scp it was waiting for.
+         *
+         *   - progress was sampled by ssh-ing to the server every few seconds
+         *     to stat the partial file. Each of those is a fresh ssh handshake
+         *     from inside a guest where a handshake alone measures ~5-10s, and
+         *     popen() blocks for all of it -- so the sampler cost more than the
+         *     interval it was sampling on.
+         *
+         *   - and it never ran anyway: the whole block was behind a flag that
+         *     was initialised to 0 and never assigned.
+         *
+         * Writing the bytes ourselves removes all three. The percentage is
+         * exact, it costs nothing to compute, and there is no second connection
+         * to the server. `cat > file` is the same idiom the hypervisor manager
+         * uses for its file pushes.
+         */
+        char ssh_put_cmd[4096];
+        int put_n = snprintf(ssh_put_cmd, sizeof(ssh_put_cmd),
+                "ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=no "
                 "-o ServerAliveInterval=10 -o ServerAliveCountMax=3 "
-                "-i /.ssh/id_ed25519 \"%s\" "
-                "%s:%s",
-                upload_path, remote_user, remote_dir);
-
-        char ssh_stat_cmd[4096];
-        snprintf(ssh_stat_cmd, sizeof(ssh_stat_cmd),
-                "ssh -i /.ssh/id_ed25519 -o StrictHostKeyChecking=no "
-                "-o ConnectTimeout=5 %s stat -c %%s %s 2>/dev/null",
+                "-i /.ssh/id_ed25519 %s \"cat > '%s'\"",
                 remote_user, remote_dir);
+        if (put_n < 0 || (size_t)put_n >= sizeof(ssh_put_cmd)) {
+            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+                "{\"state\":\"error\",\"msg\":\"upload path too long\"}");
+            return;
+        }
 
-        char stat_buf[64];
-
-        fprintf(stderr, "[cmd] Uploading file via SCP... (%lld bytes)\n", local_size);
+        fprintf(stderr, "[cmd] Uploading %s (%lld bytes) ...\n",
+                upload_path, local_size);
         fflush(stderr);
 
         g_uploading = true;
 
-        pid_t pid = fork();
-        if (pid == 0) {
-            execl("/bin/sh", "sh", "-c", scp_cmd, (char *)NULL);
-            _exit(127);
+        FILE *src = fopen(upload_path, "rb");
+        if (!src) {
+            fprintf(stderr, "[cmd] cannot read %s\n", upload_path);
+            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+                "{\"state\":\"error\",\"msg\":\"cannot read local file\"}");
+            g_uploading = false;
+            return;
         }
 
-        int last_pct = -1;
-        int scp_status;
-        time_t last_progress_time = time(NULL);
-        time_t upload_start_time = time(NULL);
-        int progress_updates_sent = 0;
+        FILE *sink = popen(ssh_put_cmd, "w");
+        if (!sink) {
+            fclose(src);
+            fprintf(stderr, "[cmd] cannot start ssh for upload\n");
+            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+                "{\"state\":\"error\",\"msg\":\"cannot start upload\"}");
+            g_uploading = false;
+            return;
+        }
 
-        while (waitpid(pid, &scp_status, WNOHANG) == 0) {
-            time_t now = time(NULL);
-            int elapsed_seconds = (int)(now - last_progress_time);
+        mqtt_client_publish_upload_progress(g_mqtt, 0);
 
-            /*
-             * Poll how much of the file has landed on the server.
-             *
-             * This whole block used to be wrapped in `if
-             * (ssh_stat_cmd_initialized)`, a local that was set to 0 at its
-             * declaration and never assigned anywhere else -- so the condition
-             * was always false and not one intermediate percentage was ever
-             * published. The only progress the GUI ever saw was the hardcoded
-             * 100 after scp returned, which is exactly why the bar jumped
-             * straight from 0 to 100. ssh_stat_cmd is built unconditionally
-             * above, so there was nothing for the flag to guard.
-             *
-             * Every 3s rather than 10s: each poll is an ssh round trip, so it
-             * cannot be tight, but 10s on a short upload produced one update
-             * at most -- which looks the same as none.
-             */
-            if (elapsed_seconds >= 3 && last_pct < 100) {
-                last_progress_time = now;      /* whether or not it answers */
+        char xfer[64 * 1024];
+        long long sent = 0;
+        int last_pct = 0;
+        int write_failed = 0;
+        size_t got;
 
-                FILE *fp = popen(ssh_stat_cmd, "r");
-                if (fp) {
-                    if (fgets(stat_buf, sizeof(stat_buf), fp)) {
-                        long long current_remote_size = atoll(stat_buf);
-                        if (current_remote_size > 0 && local_size > 0) {
-                            int pct = (int)(current_remote_size * 100 / local_size);
-                            if (pct > 100) pct = 100;
-                            /* 99 max here: 100 is published once, after scp is
-                               known to have succeeded. A file can be fully
-                               written and the transfer still fail. */
-                            if (pct > 99) pct = 99;
-                            if (pct > last_pct) {
-                                last_pct = pct;
-                                progress_updates_sent++;
-                                fprintf(stderr, "[SCP] progress %lld / %lld bytes (%d%%)\n",
-                                        current_remote_size, local_size, pct);
-                                mqtt_client_publish_upload_progress(g_mqtt, pct);
-                            }
-                        }
-                    }
-                    pclose(fp);
-                } else {
-                    fprintf(stderr, "[SCP] could not run the remote stat\n");
+        while ((got = fread(xfer, 1, sizeof(xfer), src)) > 0) {
+            if (fwrite(xfer, 1, got, sink) != got) { write_failed = 1; break; }
+            sent += (long long)got;
+
+            if (local_size > 0) {
+                int pct = (int)(sent * 100 / local_size);
+                /* 99 is the ceiling until the transfer is known to have
+                   succeeded: the last byte being written is not the same as
+                   the server having kept the file. */
+                if (pct > 99) pct = 99;
+                if (pct > last_pct) {
+                    last_pct = pct;
+                    mqtt_client_publish_upload_progress(g_mqtt, pct);
                 }
             }
+        }
+        if (ferror(src)) write_failed = 1;
 
-            // Check if upload is taking too long (more than 3 minutes)
-            if ((int)(now - upload_start_time) > 180) {
-                fprintf(stderr, "[SCP DEBUG] Upload taking too long (> 3 minutes), forcing completion\n");
-                break;
-            }
+        fclose(src);
+        pclose(sink);   /* QNX pclose() is unreliable -- verified below instead */
 
-            mqtt_client_loop(g_mqtt, 10);
+        /*
+         * One remote stat, after the fact, to decide success.
+         *
+         * pclose() on QNX reports -1 even for a child that exited 0, so it
+         * cannot be the test. Comparing the size the server ended up with
+         * against the size sent is a stronger check than an exit code anyway:
+         * it catches a connection dropped mid-write, which is the failure that
+         * actually happens here.
+         */
+        char ssh_stat_cmd[4096];
+        snprintf(ssh_stat_cmd, sizeof(ssh_stat_cmd),
+                "ssh -i /.ssh/id_ed25519 -o StrictHostKeyChecking=no "
+                "-o ConnectTimeout=15 %s stat -c %%s '%s' 2>/dev/null",
+                remote_user, remote_dir);
+
+        long long remote_size = -1;
+        FILE *sp = popen(ssh_stat_cmd, "r");
+        if (sp) {
+            char stat_buf[64];
+            if (fgets(stat_buf, sizeof(stat_buf), sp))
+                remote_size = atoll(stat_buf);
+            pclose(sp);
         }
 
-        int ok = WIFEXITED(scp_status) && WEXITSTATUS(scp_status) == 0;
+        int ok = !write_failed && remote_size == local_size;
 
         if (!ok) {
-            fprintf(stderr, "[cmd] SCP failed (exit=%d)\n",
-                    WIFEXITED(scp_status) ? WEXITSTATUS(scp_status) : -1);
+            fprintf(stderr, "[cmd] upload failed (sent=%lld of %lld, server has %lld)\n",
+                    sent, local_size, remote_size);
             mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
-                "{\"state\":\"error\",\"msg\":\"SCP upload failed\"}");
+                "{\"state\":\"error\",\"msg\":\"upload failed or incomplete\"}");
             g_uploading = false;
             return;
         }
