@@ -118,7 +118,15 @@ static uint64_t g_stop_drops = 0;
 static uint64_t g_stop_block_drops = 0;
 static uint64_t g_stop_stalled_ms = 0;
 static bool g_has_stop_data = false;
+
+/* The upload runs on its own thread now (see upload_thread), so these are read
+   and written from two threads and are only touched under the mutex.
+   g_upload_path is what that thread is streaming, kept so `delete` can refuse
+   to pull the file out from under it -- a command that could not previously
+   arrive mid-upload, because the transfer blocked the MQTT callback. */
+static pthread_mutex_t g_upload_mutex = PTHREAD_MUTEX_INITIALIZER;
 static bool g_uploading = false;
+static char g_upload_path[1024] = "";
 
 static uint64_t g_auto_stop_time = 0;
 static bool g_auto_stop_active = false;
@@ -753,6 +761,19 @@ static void handle_delete_command(const char *filename)
         return;
     }
 
+    /* Not while it is being uploaded. The GUI's own flow is upload-then-delete,
+       and now that the upload no longer blocks this handler the delete can land
+       while the file is still being read -- which on a successful unlink would
+       truncate the transfer and report success for both. */
+    pthread_mutex_lock(&g_upload_mutex);
+    bool in_flight = g_uploading && strcmp(g_upload_path, fullpath) == 0;
+    pthread_mutex_unlock(&g_upload_mutex);
+    if (in_flight) {
+        fprintf(stderr, "[cmd] Rejected delete of '%s' (upload in progress)\n", filename);
+        delete_reply(filename, false);
+        return;
+    }
+
     if (remove(fullpath) == 0) {
         fprintf(stderr, "[cmd] Deleted: %s\n", fullpath);
         delete_reply(filename, true);
@@ -760,6 +781,317 @@ static void handle_delete_command(const char *filename)
         fprintf(stderr, "[cmd] Failed to delete: %s\n", fullpath);
         delete_reply(filename, false);
     }
+}
+
+/* ======== Upload ======== */
+
+/*
+ * The upload runs on its own thread, and that is the whole reason the progress
+ * bar moves.
+ *
+ * handle_command() is called from libmosquitto's message callback, and with
+ * mosquitto_loop_start() that callback runs ON the network thread. That thread
+ * is the only thing that ever writes to the broker socket:
+ * mosquitto_publish() does not send, it appends to the out-packet queue and
+ * returns, and the queue is drained by the loop -- which cannot run while it is
+ * sitting inside our callback.
+ *
+ * So doing the upload inline meant every progress publish piled up in that
+ * queue for the entire transfer and then flushed in one burst the instant the
+ * callback returned. The percentages were computed correctly and published in
+ * order; they just all arrived at once, at the end, which is exactly what the
+ * GUI showed: a bar that sat at 0 and then snapped to 100.
+ *
+ * Blocking the network thread for a minute also meant no PINGREQ went out
+ * during the transfer, so with MQTT_KEEPALIVE at 60s the broker would drop the
+ * recorder mid-upload -- the same cause, a different symptom.
+ *
+ * Returning from the callback immediately and streaming the file from a
+ * detached thread fixes both: the loop keeps draining the queue, so each
+ * publish leaves as it is made.
+ */
+typedef struct {
+    char path[1024];
+} upload_job_t;
+
+static void *upload_thread(void *arg)
+{
+    upload_job_t *job = (upload_job_t *)arg;
+    const char *upload_path = job->path;
+
+    struct stat st;
+    long long local_size = 0;
+    if (stat(upload_path, &st) == 0)
+        local_size = st.st_size;
+
+    const char *fname = strrchr(upload_path, '/');
+    fname = fname ? fname + 1 : upload_path;
+
+    char remote_dir[2048];
+    snprintf(remote_dir, sizeof(remote_dir),
+            "/home/maxmaster/uploads/%s", fname);
+
+    char remote_user[] = "maxmaster@139.185.38.211";
+
+    /*
+     * The file is streamed through ssh rather than handed to scp, so that
+     * progress comes from bytes this process has actually written.
+     *
+     * What was here before could not report progress at all, for three
+     * separate reasons stacked on top of each other:
+     *
+     *   - scp ran in a forked child and the parent watched it with
+     *     waitpid(WNOHANG) in a loop whose only other statement was
+     *     mqtt_client_loop(), which is a no-op on this build (the network
+     *     runs on mosquitto's own thread). So the loop had no sleep in it
+     *     at all: it spun at 100% CPU on a guest with ONE vCPU, competing
+     *     with the scp it was waiting for.
+     *
+     *   - progress was sampled by ssh-ing to the server every few seconds
+     *     to stat the partial file. Each of those is a fresh ssh handshake
+     *     from inside a guest where a handshake alone measures ~5-10s, and
+     *     popen() blocks for all of it -- so the sampler cost more than the
+     *     interval it was sampling on.
+     *
+     *   - and it never ran anyway: the whole block was behind a flag that
+     *     was initialised to 0 and never assigned.
+     *
+     * Writing the bytes ourselves removes all three. The percentage is
+     * exact, it costs nothing to compute, and there is no second connection
+     * to the server. `cat > file` is the same idiom the hypervisor manager
+     * uses for its file pushes.
+     */
+    /*
+     * BatchMode=yes is not optional here, it is what makes the failure
+     * survivable.
+     *
+     * This process writes the payload into ssh's STDIN. If ssh cannot
+     * authenticate non-interactively -- a missing or unreadable key, which
+     * is exactly what "Identity file /.ssh/id_ed25519 not accessible"
+     * reports -- it falls back to asking for a password, and the thing it
+     * reads that password from is the same pipe. So it consumes the CSV as
+     * a series of failed password attempts, never authenticates, and never
+     * returns: the upload appears to hang with no error at all. That is the
+     * exact shape of the failure this replaced scp with.
+     *
+     * BatchMode makes ssh refuse to prompt and exit instead, so the write
+     * fails immediately and the reason reaches the GUI. It also means an
+     * uploads-only key really is required; there is no silent fallback.
+     *
+     * stderr goes to a file rather than the console so that reason can be
+     * published, instead of scrolling past on a board nobody is watching.
+     */
+    char err_path[512];
+    snprintf(err_path, sizeof(err_path), "%s/.upload_err", g_save_dir);
+
+    /*
+     * The key was hardcoded to /.ssh/id_ed25519, and on this guest that
+     * path does not exist -- ssh says so on every upload:
+     *
+     *     Warning: Identity file /.ssh/id_ed25519 not accessible
+     *
+     * which mattered little while ssh could still fall back to asking for
+     * a password, and matters entirely now that BatchMode forbids it. The
+     * default is unchanged so nothing that works today stops working;
+     * MOTOR_UPLOAD_KEY points it somewhere real without a rebuild.
+     */
+    /*
+     * Look where the key actually is.
+     *
+     * This was a single hardcoded "/.ssh/id_ed25519" -- the filesystem
+     * ROOT, not root's home. The guest keeps its key at ~/.ssh, so
+     * /root/.ssh/id_ed25519 exists and /.ssh/id_ed25519 never has, and
+     * every upload reported the key as missing while it was sitting one
+     * directory away. Try the usual places instead of asserting one.
+     */
+    char key_buf[512];
+    const char *key_path = NULL;
+    const char *env_key = getenv("MOTOR_UPLOAD_KEY");
+    const char *home = getenv("HOME");
+
+    if (env_key && *env_key) {
+        /* Explicitly set: use it or fail, rather than quietly falling back
+           to some other key and uploading under an identity nobody chose. */
+        key_path = (access(env_key, R_OK) == 0) ? env_key : NULL;
+        if (!key_path)
+            fprintf(stderr, "[cmd] MOTOR_UPLOAD_KEY='%s' is not readable\n", env_key);
+    } else {
+        const char *candidates[4];
+        int n_cand = 0;
+        if (home && *home) {
+            snprintf(key_buf, sizeof(key_buf), "%s/.ssh/id_ed25519", home);
+            candidates[n_cand++] = key_buf;
+        }
+        candidates[n_cand++] = "/root/.ssh/id_ed25519";
+        candidates[n_cand++] = "/.ssh/id_ed25519";
+
+        for (int ci = 0; ci < n_cand; ci++) {
+            if (access(candidates[ci], R_OK) == 0) {
+                key_path = candidates[ci];
+                break;
+            }
+        }
+    }
+
+    if (!key_path) {
+        fprintf(stderr, "[cmd] no readable upload key (tried $MOTOR_UPLOAD_KEY, "
+                        "$HOME/.ssh/id_ed25519, /root/.ssh/id_ed25519, "
+                        "/.ssh/id_ed25519)\n");
+        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+            "{\"state\":\"error\",\"msg\":\"no readable upload key -- set "
+            "MOTOR_UPLOAD_KEY\"}");
+        goto done;
+    }
+    fprintf(stderr, "[cmd] upload key: %s\n", key_path);
+
+    char ssh_put_cmd[4096];
+    int put_n = snprintf(ssh_put_cmd, sizeof(ssh_put_cmd),
+            "ssh -o BatchMode=yes -o ConnectTimeout=30 "
+            "-o StrictHostKeyChecking=no -o PasswordAuthentication=no "
+            "-o ServerAliveInterval=10 -o ServerAliveCountMax=3 "
+            "-i %s %s \"cat > '%s'\" 2>%s",
+            key_path, remote_user, remote_dir, err_path);
+    if (put_n < 0 || (size_t)put_n >= sizeof(ssh_put_cmd)) {
+        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+            "{\"state\":\"error\",\"msg\":\"upload path too long\"}");
+        goto done;
+    }
+
+    fprintf(stderr, "[cmd] Uploading %s (%lld bytes) ...\n",
+            upload_path, local_size);
+    fflush(stderr);
+
+    FILE *src = fopen(upload_path, "rb");
+    if (!src) {
+        fprintf(stderr, "[cmd] cannot read %s\n", upload_path);
+        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+            "{\"state\":\"error\",\"msg\":\"cannot read local file\"}");
+        goto done;
+    }
+
+    FILE *sink = popen(ssh_put_cmd, "w");
+    if (!sink) {
+        fclose(src);
+        fprintf(stderr, "[cmd] cannot start ssh for upload\n");
+        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+            "{\"state\":\"error\",\"msg\":\"cannot start upload\"}");
+        goto done;
+    }
+
+    mqtt_client_publish_upload_progress(g_mqtt, 0);
+
+    /*
+     * 32K chunks, flushed.
+     *
+     * The chunk size sets how finely the bar can move, and the flush is
+     * what makes `sent` mean "handed to ssh" rather than "sitting in
+     * stdio's buffer": without it the count runs ahead in 64K steps as the
+     * buffer fills and then stalls while it drains, so the bar advanced in
+     * lurches even though the arithmetic was right.
+     *
+     * fwrite blocks here once ssh's own buffer is full, which is the
+     * desired behaviour -- it paces this loop to the network instead of
+     * spinning.
+     */
+    char xfer[32 * 1024];
+    long long sent = 0;
+    int last_pct = 0;
+    int write_failed = 0;
+    size_t got;
+
+    while ((got = fread(xfer, 1, sizeof(xfer), src)) > 0) {
+        if (fwrite(xfer, 1, got, sink) != got) { write_failed = 1; break; }
+        fflush(sink);
+        sent += (long long)got;
+
+        if (local_size > 0) {
+            /* Only when the whole percent changes. The payload carries an
+               integer percent, so the finer steps this used to publish were
+               ten identical messages per step -- a thousand QoS 0 publishes
+               per upload that the GUI could not distinguish from a hundred. */
+            int pct = (int)(sent * 100 / local_size);
+            if (pct > 99) pct = 99;   /* 100 is the completion publish below */
+            if (pct > last_pct) {
+                last_pct = pct;
+                mqtt_client_publish_upload_progress(g_mqtt, pct);
+            }
+        }
+    }
+    if (ferror(src)) write_failed = 1;
+
+    fclose(src);
+    pclose(sink);   /* QNX pclose() is unreliable -- verified below instead */
+
+    /*
+     * One remote stat, after the fact, to decide success.
+     *
+     * pclose() on QNX reports -1 even for a child that exited 0, so it
+     * cannot be the test. Comparing the size the server ended up with
+     * against the size sent is a stronger check than an exit code anyway:
+     * it catches a connection dropped mid-write, which is the failure that
+     * actually happens here.
+     */
+    char ssh_stat_cmd[4096];
+    snprintf(ssh_stat_cmd, sizeof(ssh_stat_cmd),
+            "ssh -i %s -o BatchMode=yes -o StrictHostKeyChecking=no "
+            "-o ConnectTimeout=15 %s stat -c %%s '%s' 2>/dev/null",
+            key_path, remote_user, remote_dir);
+
+    long long remote_size = -1;
+    FILE *sp = popen(ssh_stat_cmd, "r");
+    if (sp) {
+        char stat_buf[64];
+        if (fgets(stat_buf, sizeof(stat_buf), sp))
+            remote_size = atoll(stat_buf);
+        pclose(sp);
+    }
+
+    int ok = !write_failed && remote_size == local_size;
+
+    if (!ok) {
+        /* Whatever ssh said, verbatim -- "Permission denied (publickey)"
+           is actionable, "upload failed" is not. */
+        char why[400] = "";
+        FILE *ef = fopen(err_path, "r");
+        if (ef) {
+            size_t got_err = fread(why, 1, sizeof(why) - 1, ef);
+            why[got_err] = '\0';
+            fclose(ef);
+        }
+        remove(err_path);
+
+        fprintf(stderr, "[cmd] upload failed (sent=%lld of %lld, server has %lld): %s\n",
+                sent, local_size, remote_size, why[0] ? why : "(no message)");
+
+        char esc[600];
+        json_escape(why[0] ? why : "upload failed or incomplete", esc, sizeof(esc));
+        char resp[800];
+        snprintf(resp, sizeof(resp),
+                 "{\"state\":\"error\",\"msg\":\"upload failed: %s\"}", esc);
+        mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, resp);
+        goto done;
+    }
+    remove(err_path);
+
+    fprintf(stderr, "[cmd] SCP done.\n");
+
+    char remote_path[4096] = "";
+    snprintf(remote_path, sizeof(remote_path),
+             "%s:%s", remote_user, remote_dir);
+    mqtt_client_publish_upload_progress(g_mqtt, 100);
+
+    mqtt_client_publish_stop_metadata(g_mqtt, upload_path, remote_path,
+                                      g_stop_span_us, g_stop_total_rows,
+                                      g_stop_drops, g_stop_block_drops,
+                                      g_stop_stalled_ms);
+
+done:
+    free(job);
+    pthread_mutex_lock(&g_upload_mutex);
+    g_uploading = false;
+    g_upload_path[0] = '\0';
+    pthread_mutex_unlock(&g_upload_mutex);
+    return NULL;
 }
 
 /* ======== MQTT command handler ======== */
@@ -842,308 +1174,87 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
         const char *arg = cmd + 6;
         while (*arg == ' ') arg++;
 
-        // Prevent multiple concurrent uploads
-        if (g_uploading) {
+        /* Everything here is cheap and answers immediately; the transfer
+           itself goes to upload_thread() so this callback -- and with it
+           mosquitto's network loop -- is not held for the duration. See the
+           comment on upload_thread(). */
+
+        /* Prevent multiple concurrent uploads. Tested and set under the lock,
+           because the flag is now cleared by the worker rather than by this
+           thread on its way out. */
+        pthread_mutex_lock(&g_upload_mutex);
+        bool busy = g_uploading;
+        if (!busy) g_uploading = true;
+        pthread_mutex_unlock(&g_upload_mutex);
+
+        if (busy) {
             fprintf(stderr, "[cmd] Upload already in progress, ignoring new upload command\n");
             mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
                 "{\"state\":\"error\",\"msg\":\"Upload already in progress\"}");
             return;
         }
 
-        char upload_path[1024] = "";
+        upload_job_t *job = calloc(1, sizeof(*job));
+        if (!job) {
+            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+                "{\"state\":\"error\",\"msg\":\"out of memory\"}");
+            goto upload_abort;
+        }
+
         if (*arg != '\0') {
             if (strchr(arg, '/'))
-                snprintf(upload_path, sizeof(upload_path), "%s", arg);
+                snprintf(job->path, sizeof(job->path), "%s", arg);
             else
-                snprintf(upload_path, sizeof(upload_path), "%s/%s", g_save_dir, arg);
+                snprintf(job->path, sizeof(job->path), "%s/%s", g_save_dir, arg);
         } else if (g_csv_filename[0] != '\0') {
-            snprintf(upload_path, sizeof(upload_path), "%s", g_csv_filename);
+            snprintf(job->path, sizeof(job->path), "%s", g_csv_filename);
         } else {
             fprintf(stderr, "[cmd] No file to upload\n");
             mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
                 "{\"state\":\"error\",\"msg\":\"No file to upload\"}");
-            return;
+            free(job);
+            goto upload_abort;
         }
 
-        if (access(upload_path, F_OK) != 0) {
-            fprintf(stderr, "[cmd] File not found: %s\n", upload_path);
+        if (access(job->path, F_OK) != 0) {
+            fprintf(stderr, "[cmd] File not found: %s\n", job->path);
             mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
                 "{\"state\":\"error\",\"msg\":\"File not found\"}");
-            return;
+            free(job);
+            goto upload_abort;
         }
 
-        struct stat st;
-        long long local_size = 0;
-        if (stat(upload_path, &st) == 0)
-            local_size = st.st_size;
+        /* Published before the thread starts, so it is already set by the time
+           any later command can observe it. */
+        pthread_mutex_lock(&g_upload_mutex);
+        snprintf(g_upload_path, sizeof(g_upload_path), "%s", job->path);
+        pthread_mutex_unlock(&g_upload_mutex);
 
-        const char *fname = strrchr(upload_path, '/');
-        fname = fname ? fname + 1 : upload_path;
+        /* Detached: nothing joins it, and the recorder must not accumulate
+           unreaped thread state across a session's worth of uploads. */
+        pthread_t tid;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        int trc = pthread_create(&tid, &attr, upload_thread, job);
+        pthread_attr_destroy(&attr);
 
-        char remote_dir[2048];
-        snprintf(remote_dir, sizeof(remote_dir),
-                "/home/maxmaster/uploads/%s", fname);
-
-        char remote_user[] = "maxmaster@139.185.38.211";
-
-        /*
-         * The file is streamed through ssh rather than handed to scp, so that
-         * progress comes from bytes this process has actually written.
-         *
-         * What was here before could not report progress at all, for three
-         * separate reasons stacked on top of each other:
-         *
-         *   - scp ran in a forked child and the parent watched it with
-         *     waitpid(WNOHANG) in a loop whose only other statement was
-         *     mqtt_client_loop(), which is a no-op on this build (the network
-         *     runs on mosquitto's own thread). So the loop had no sleep in it
-         *     at all: it spun at 100% CPU on a guest with ONE vCPU, competing
-         *     with the scp it was waiting for.
-         *
-         *   - progress was sampled by ssh-ing to the server every few seconds
-         *     to stat the partial file. Each of those is a fresh ssh handshake
-         *     from inside a guest where a handshake alone measures ~5-10s, and
-         *     popen() blocks for all of it -- so the sampler cost more than the
-         *     interval it was sampling on.
-         *
-         *   - and it never ran anyway: the whole block was behind a flag that
-         *     was initialised to 0 and never assigned.
-         *
-         * Writing the bytes ourselves removes all three. The percentage is
-         * exact, it costs nothing to compute, and there is no second connection
-         * to the server. `cat > file` is the same idiom the hypervisor manager
-         * uses for its file pushes.
-         */
-        /*
-         * BatchMode=yes is not optional here, it is what makes the failure
-         * survivable.
-         *
-         * This process writes the payload into ssh's STDIN. If ssh cannot
-         * authenticate non-interactively -- a missing or unreadable key, which
-         * is exactly what "Identity file /.ssh/id_ed25519 not accessible"
-         * reports -- it falls back to asking for a password, and the thing it
-         * reads that password from is the same pipe. So it consumes the CSV as
-         * a series of failed password attempts, never authenticates, and never
-         * returns: the upload appears to hang with no error at all. That is the
-         * exact shape of the failure this replaced scp with.
-         *
-         * BatchMode makes ssh refuse to prompt and exit instead, so the write
-         * fails immediately and the reason reaches the GUI. It also means an
-         * uploads-only key really is required; there is no silent fallback.
-         *
-         * stderr goes to a file rather than the console so that reason can be
-         * published, instead of scrolling past on a board nobody is watching.
-         */
-        char err_path[512];
-        snprintf(err_path, sizeof(err_path), "%s/.upload_err", g_save_dir);
-
-        /*
-         * The key was hardcoded to /.ssh/id_ed25519, and on this guest that
-         * path does not exist -- ssh says so on every upload:
-         *
-         *     Warning: Identity file /.ssh/id_ed25519 not accessible
-         *
-         * which mattered little while ssh could still fall back to asking for
-         * a password, and matters entirely now that BatchMode forbids it. The
-         * default is unchanged so nothing that works today stops working;
-         * MOTOR_UPLOAD_KEY points it somewhere real without a rebuild.
-         */
-        /*
-         * Look where the key actually is.
-         *
-         * This was a single hardcoded "/.ssh/id_ed25519" -- the filesystem
-         * ROOT, not root's home. The guest keeps its key at ~/.ssh, so
-         * /root/.ssh/id_ed25519 exists and /.ssh/id_ed25519 never has, and
-         * every upload reported the key as missing while it was sitting one
-         * directory away. Try the usual places instead of asserting one.
-         */
-        char key_buf[512];
-        const char *key_path = NULL;
-        const char *env_key = getenv("MOTOR_UPLOAD_KEY");
-        const char *home = getenv("HOME");
-
-        if (env_key && *env_key) {
-            /* Explicitly set: use it or fail, rather than quietly falling back
-               to some other key and uploading under an identity nobody chose. */
-            key_path = (access(env_key, R_OK) == 0) ? env_key : NULL;
-            if (!key_path)
-                fprintf(stderr, "[cmd] MOTOR_UPLOAD_KEY='%s' is not readable\n", env_key);
-        } else {
-            const char *candidates[4];
-            int n_cand = 0;
-            if (home && *home) {
-                snprintf(key_buf, sizeof(key_buf), "%s/.ssh/id_ed25519", home);
-                candidates[n_cand++] = key_buf;
-            }
-            candidates[n_cand++] = "/root/.ssh/id_ed25519";
-            candidates[n_cand++] = "/.ssh/id_ed25519";
-
-            for (int ci = 0; ci < n_cand; ci++) {
-                if (access(candidates[ci], R_OK) == 0) {
-                    key_path = candidates[ci];
-                    break;
-                }
-            }
-        }
-
-        if (!key_path) {
-            fprintf(stderr, "[cmd] no readable upload key (tried $MOTOR_UPLOAD_KEY, "
-                            "$HOME/.ssh/id_ed25519, /root/.ssh/id_ed25519, "
-                            "/.ssh/id_ed25519)\n");
-            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
-                "{\"state\":\"error\",\"msg\":\"no readable upload key -- set "
-                "MOTOR_UPLOAD_KEY\"}");
-            g_uploading = false;
-            return;
-        }
-        fprintf(stderr, "[cmd] upload key: %s\n", key_path);
-
-        char ssh_put_cmd[4096];
-        int put_n = snprintf(ssh_put_cmd, sizeof(ssh_put_cmd),
-                "ssh -o BatchMode=yes -o ConnectTimeout=30 "
-                "-o StrictHostKeyChecking=no -o PasswordAuthentication=no "
-                "-o ServerAliveInterval=10 -o ServerAliveCountMax=3 "
-                "-i %s %s \"cat > '%s'\" 2>%s",
-                key_path, remote_user, remote_dir, err_path);
-        if (put_n < 0 || (size_t)put_n >= sizeof(ssh_put_cmd)) {
-            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
-                "{\"state\":\"error\",\"msg\":\"upload path too long\"}");
-            return;
-        }
-
-        fprintf(stderr, "[cmd] Uploading %s (%lld bytes) ...\n",
-                upload_path, local_size);
-        fflush(stderr);
-
-        g_uploading = true;
-
-        FILE *src = fopen(upload_path, "rb");
-        if (!src) {
-            fprintf(stderr, "[cmd] cannot read %s\n", upload_path);
-            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
-                "{\"state\":\"error\",\"msg\":\"cannot read local file\"}");
-            g_uploading = false;
-            return;
-        }
-
-        FILE *sink = popen(ssh_put_cmd, "w");
-        if (!sink) {
-            fclose(src);
-            fprintf(stderr, "[cmd] cannot start ssh for upload\n");
+        if (trc != 0) {
+            fprintf(stderr, "[cmd] cannot start upload thread: %s\n", strerror(trc));
             mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
                 "{\"state\":\"error\",\"msg\":\"cannot start upload\"}");
-            g_uploading = false;
-            return;
+            free(job);
+            goto upload_abort;
         }
 
-        mqtt_client_publish_upload_progress(g_mqtt, 0);
+        return;
 
-        /*
-         * 32K chunks, flushed.
-         *
-         * The chunk size sets how finely the bar can move, and the flush is
-         * what makes `sent` mean "handed to ssh" rather than "sitting in
-         * stdio's buffer": without it the count runs ahead in 64K steps as the
-         * buffer fills and then stalls while it drains, so the bar advanced in
-         * lurches even though the arithmetic was right.
-         *
-         * fwrite blocks here once ssh's own buffer is full, which is the
-         * desired behaviour -- it paces this loop to the network instead of
-         * spinning.
-         */
-        char xfer[32 * 1024];
-        long long sent = 0;
-        int last_pct = 0;
-        int write_failed = 0;
-        size_t got;
-
-        while ((got = fread(xfer, 1, sizeof(xfer), src)) > 0) {
-            if (fwrite(xfer, 1, got, sink) != got) { write_failed = 1; break; }
-            fflush(sink);
-            sent += (long long)got;
-
-            if (local_size > 0) {
-                /* Tenths of a percent, so a small file still produces a moving
-                   bar rather than a handful of jumps. The GUI animates between
-                   whatever it is given, so more steps cost nothing but a few
-                   QoS 0 publishes. */
-                int tenths = (int)(sent * 1000 / local_size);
-                if (tenths > 990) tenths = 990;
-                if (tenths > last_pct) {
-                    last_pct = tenths;
-                    mqtt_client_publish_upload_progress(g_mqtt, tenths / 10);
-                }
-            }
-        }
-        if (ferror(src)) write_failed = 1;
-
-        fclose(src);
-        pclose(sink);   /* QNX pclose() is unreliable -- verified below instead */
-
-        /*
-         * One remote stat, after the fact, to decide success.
-         *
-         * pclose() on QNX reports -1 even for a child that exited 0, so it
-         * cannot be the test. Comparing the size the server ended up with
-         * against the size sent is a stronger check than an exit code anyway:
-         * it catches a connection dropped mid-write, which is the failure that
-         * actually happens here.
-         */
-        char ssh_stat_cmd[4096];
-        snprintf(ssh_stat_cmd, sizeof(ssh_stat_cmd),
-                "ssh -i %s -o BatchMode=yes -o StrictHostKeyChecking=no "
-                "-o ConnectTimeout=15 %s stat -c %%s '%s' 2>/dev/null",
-                key_path, remote_user, remote_dir);
-
-        long long remote_size = -1;
-        FILE *sp = popen(ssh_stat_cmd, "r");
-        if (sp) {
-            char stat_buf[64];
-            if (fgets(stat_buf, sizeof(stat_buf), sp))
-                remote_size = atoll(stat_buf);
-            pclose(sp);
-        }
-
-        int ok = !write_failed && remote_size == local_size;
-
-        if (!ok) {
-            /* Whatever ssh said, verbatim -- "Permission denied (publickey)"
-               is actionable, "upload failed" is not. */
-            char why[400] = "";
-            FILE *ef = fopen(err_path, "r");
-            if (ef) {
-                size_t got_err = fread(why, 1, sizeof(why) - 1, ef);
-                why[got_err] = '\0';
-                fclose(ef);
-            }
-            remove(err_path);
-
-            fprintf(stderr, "[cmd] upload failed (sent=%lld of %lld, server has %lld): %s\n",
-                    sent, local_size, remote_size, why[0] ? why : "(no message)");
-
-            char esc[600];
-            json_escape(why[0] ? why : "upload failed or incomplete", esc, sizeof(esc));
-            char resp[800];
-            snprintf(resp, sizeof(resp),
-                     "{\"state\":\"error\",\"msg\":\"upload failed: %s\"}", esc);
-            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, resp);
-            g_uploading = false;
-            return;
-        }
-        remove(err_path);
-
-        fprintf(stderr, "[cmd] SCP done.\n");
-
-        char remote_path[4096] = "";
-        snprintf(remote_path, sizeof(remote_path),
-                 "%s:%s", remote_user, remote_dir);
-        mqtt_client_publish_upload_progress(g_mqtt, 100);
-
-        mqtt_client_publish_stop_metadata(g_mqtt, upload_path, remote_path,
-                                          g_stop_span_us, g_stop_total_rows,
-                                          g_stop_drops, g_stop_block_drops,
-                                          g_stop_stalled_ms);
+    upload_abort:
+        pthread_mutex_lock(&g_upload_mutex);
         g_uploading = false;
+        g_upload_path[0] = '\0';
+        pthread_mutex_unlock(&g_upload_mutex);
+        return;
     }
     else if (strcmp(cmd, "list") == 0) {
         handle_list_command();
