@@ -953,7 +953,20 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
 
         mqtt_client_publish_upload_progress(g_mqtt, 0);
 
-        char xfer[64 * 1024];
+        /*
+         * 32K chunks, flushed.
+         *
+         * The chunk size sets how finely the bar can move, and the flush is
+         * what makes `sent` mean "handed to ssh" rather than "sitting in
+         * stdio's buffer": without it the count runs ahead in 64K steps as the
+         * buffer fills and then stalls while it drains, so the bar advanced in
+         * lurches even though the arithmetic was right.
+         *
+         * fwrite blocks here once ssh's own buffer is full, which is the
+         * desired behaviour -- it paces this loop to the network instead of
+         * spinning.
+         */
+        char xfer[32 * 1024];
         long long sent = 0;
         int last_pct = 0;
         int write_failed = 0;
@@ -961,17 +974,19 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
 
         while ((got = fread(xfer, 1, sizeof(xfer), src)) > 0) {
             if (fwrite(xfer, 1, got, sink) != got) { write_failed = 1; break; }
+            fflush(sink);
             sent += (long long)got;
 
             if (local_size > 0) {
-                int pct = (int)(sent * 100 / local_size);
-                /* 99 is the ceiling until the transfer is known to have
-                   succeeded: the last byte being written is not the same as
-                   the server having kept the file. */
-                if (pct > 99) pct = 99;
-                if (pct > last_pct) {
-                    last_pct = pct;
-                    mqtt_client_publish_upload_progress(g_mqtt, pct);
+                /* Tenths of a percent, so a small file still produces a moving
+                   bar rather than a handful of jumps. The GUI animates between
+                   whatever it is given, so more steps cost nothing but a few
+                   QoS 0 publishes. */
+                int tenths = (int)(sent * 1000 / local_size);
+                if (tenths > 990) tenths = 990;
+                if (tenths > last_pct) {
+                    last_pct = tenths;
+                    mqtt_client_publish_upload_progress(g_mqtt, tenths / 10);
                 }
             }
         }
