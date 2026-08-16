@@ -914,12 +914,63 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
          * to the server. `cat > file` is the same idiom the hypervisor manager
          * uses for its file pushes.
          */
+        /*
+         * BatchMode=yes is not optional here, it is what makes the failure
+         * survivable.
+         *
+         * This process writes the payload into ssh's STDIN. If ssh cannot
+         * authenticate non-interactively -- a missing or unreadable key, which
+         * is exactly what "Identity file /.ssh/id_ed25519 not accessible"
+         * reports -- it falls back to asking for a password, and the thing it
+         * reads that password from is the same pipe. So it consumes the CSV as
+         * a series of failed password attempts, never authenticates, and never
+         * returns: the upload appears to hang with no error at all. That is the
+         * exact shape of the failure this replaced scp with.
+         *
+         * BatchMode makes ssh refuse to prompt and exit instead, so the write
+         * fails immediately and the reason reaches the GUI. It also means an
+         * uploads-only key really is required; there is no silent fallback.
+         *
+         * stderr goes to a file rather than the console so that reason can be
+         * published, instead of scrolling past on a board nobody is watching.
+         */
+        char err_path[512];
+        snprintf(err_path, sizeof(err_path), "%s/.upload_err", g_save_dir);
+
+        /*
+         * The key was hardcoded to /.ssh/id_ed25519, and on this guest that
+         * path does not exist -- ssh says so on every upload:
+         *
+         *     Warning: Identity file /.ssh/id_ed25519 not accessible
+         *
+         * which mattered little while ssh could still fall back to asking for
+         * a password, and matters entirely now that BatchMode forbids it. The
+         * default is unchanged so nothing that works today stops working;
+         * MOTOR_UPLOAD_KEY points it somewhere real without a rebuild.
+         */
+        const char *key_path = getenv("MOTOR_UPLOAD_KEY");
+        if (!key_path || !*key_path) key_path = "/.ssh/id_ed25519";
+        if (access(key_path, R_OK) != 0) {
+            fprintf(stderr, "[cmd] upload key '%s' is not readable -- set "
+                            "MOTOR_UPLOAD_KEY to the private key to use\n", key_path);
+            char esc_k[400];
+            json_escape(key_path, esc_k, sizeof(esc_k));
+            char resp_k[600];
+            snprintf(resp_k, sizeof(resp_k),
+                     "{\"state\":\"error\",\"msg\":\"upload key not readable: %s "
+                     "(set MOTOR_UPLOAD_KEY)\"}", esc_k);
+            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, resp_k);
+            g_uploading = false;
+            return;
+        }
+
         char ssh_put_cmd[4096];
         int put_n = snprintf(ssh_put_cmd, sizeof(ssh_put_cmd),
-                "ssh -o ConnectTimeout=30 -o StrictHostKeyChecking=no "
+                "ssh -o BatchMode=yes -o ConnectTimeout=30 "
+                "-o StrictHostKeyChecking=no -o PasswordAuthentication=no "
                 "-o ServerAliveInterval=10 -o ServerAliveCountMax=3 "
-                "-i /.ssh/id_ed25519 %s \"cat > '%s'\"",
-                remote_user, remote_dir);
+                "-i %s %s \"cat > '%s'\" 2>%s",
+                key_path, remote_user, remote_dir, err_path);
         if (put_n < 0 || (size_t)put_n >= sizeof(ssh_put_cmd)) {
             mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
                 "{\"state\":\"error\",\"msg\":\"upload path too long\"}");
@@ -1006,9 +1057,9 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
          */
         char ssh_stat_cmd[4096];
         snprintf(ssh_stat_cmd, sizeof(ssh_stat_cmd),
-                "ssh -i /.ssh/id_ed25519 -o StrictHostKeyChecking=no "
+                "ssh -i %s -o BatchMode=yes -o StrictHostKeyChecking=no "
                 "-o ConnectTimeout=15 %s stat -c %%s '%s' 2>/dev/null",
-                remote_user, remote_dir);
+                key_path, remote_user, remote_dir);
 
         long long remote_size = -1;
         FILE *sp = popen(ssh_stat_cmd, "r");
@@ -1022,13 +1073,30 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
         int ok = !write_failed && remote_size == local_size;
 
         if (!ok) {
-            fprintf(stderr, "[cmd] upload failed (sent=%lld of %lld, server has %lld)\n",
-                    sent, local_size, remote_size);
-            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
-                "{\"state\":\"error\",\"msg\":\"upload failed or incomplete\"}");
+            /* Whatever ssh said, verbatim -- "Permission denied (publickey)"
+               is actionable, "upload failed" is not. */
+            char why[400] = "";
+            FILE *ef = fopen(err_path, "r");
+            if (ef) {
+                size_t got_err = fread(why, 1, sizeof(why) - 1, ef);
+                why[got_err] = '\0';
+                fclose(ef);
+            }
+            remove(err_path);
+
+            fprintf(stderr, "[cmd] upload failed (sent=%lld of %lld, server has %lld): %s\n",
+                    sent, local_size, remote_size, why[0] ? why : "(no message)");
+
+            char esc[600];
+            json_escape(why[0] ? why : "upload failed or incomplete", esc, sizeof(esc));
+            char resp[800];
+            snprintf(resp, sizeof(resp),
+                     "{\"state\":\"error\",\"msg\":\"upload failed: %s\"}", esc);
+            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, resp);
             g_uploading = false;
             return;
         }
+        remove(err_path);
 
         fprintf(stderr, "[cmd] SCP done.\n");
 
