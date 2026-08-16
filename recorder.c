@@ -948,21 +948,55 @@ static void handle_command(mqtt_client_t *m, const char *cmd)
          * default is unchanged so nothing that works today stops working;
          * MOTOR_UPLOAD_KEY points it somewhere real without a rebuild.
          */
-        const char *key_path = getenv("MOTOR_UPLOAD_KEY");
-        if (!key_path || !*key_path) key_path = "/.ssh/id_ed25519";
-        if (access(key_path, R_OK) != 0) {
-            fprintf(stderr, "[cmd] upload key '%s' is not readable -- set "
-                            "MOTOR_UPLOAD_KEY to the private key to use\n", key_path);
-            char esc_k[400];
-            json_escape(key_path, esc_k, sizeof(esc_k));
-            char resp_k[600];
-            snprintf(resp_k, sizeof(resp_k),
-                     "{\"state\":\"error\",\"msg\":\"upload key not readable: %s "
-                     "(set MOTOR_UPLOAD_KEY)\"}", esc_k);
-            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC, resp_k);
+        /*
+         * Look where the key actually is.
+         *
+         * This was a single hardcoded "/.ssh/id_ed25519" -- the filesystem
+         * ROOT, not root's home. The guest keeps its key at ~/.ssh, so
+         * /root/.ssh/id_ed25519 exists and /.ssh/id_ed25519 never has, and
+         * every upload reported the key as missing while it was sitting one
+         * directory away. Try the usual places instead of asserting one.
+         */
+        char key_buf[512];
+        const char *key_path = NULL;
+        const char *env_key = getenv("MOTOR_UPLOAD_KEY");
+        const char *home = getenv("HOME");
+
+        if (env_key && *env_key) {
+            /* Explicitly set: use it or fail, rather than quietly falling back
+               to some other key and uploading under an identity nobody chose. */
+            key_path = (access(env_key, R_OK) == 0) ? env_key : NULL;
+            if (!key_path)
+                fprintf(stderr, "[cmd] MOTOR_UPLOAD_KEY='%s' is not readable\n", env_key);
+        } else {
+            const char *candidates[4];
+            int n_cand = 0;
+            if (home && *home) {
+                snprintf(key_buf, sizeof(key_buf), "%s/.ssh/id_ed25519", home);
+                candidates[n_cand++] = key_buf;
+            }
+            candidates[n_cand++] = "/root/.ssh/id_ed25519";
+            candidates[n_cand++] = "/.ssh/id_ed25519";
+
+            for (int ci = 0; ci < n_cand; ci++) {
+                if (access(candidates[ci], R_OK) == 0) {
+                    key_path = candidates[ci];
+                    break;
+                }
+            }
+        }
+
+        if (!key_path) {
+            fprintf(stderr, "[cmd] no readable upload key (tried $MOTOR_UPLOAD_KEY, "
+                            "$HOME/.ssh/id_ed25519, /root/.ssh/id_ed25519, "
+                            "/.ssh/id_ed25519)\n");
+            mqtt_client_publish_raw(g_mqtt, STATUS_TOPIC,
+                "{\"state\":\"error\",\"msg\":\"no readable upload key -- set "
+                "MOTOR_UPLOAD_KEY\"}");
             g_uploading = false;
             return;
         }
+        fprintf(stderr, "[cmd] upload key: %s\n", key_path);
 
         char ssh_put_cmd[4096];
         int put_n = snprintf(ssh_put_cmd, sizeof(ssh_put_cmd),
