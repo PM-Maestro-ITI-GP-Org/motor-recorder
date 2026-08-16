@@ -288,21 +288,42 @@ void mqtt_client_publish_status(mqtt_client_t *m, rec_state_t state, const char 
     }
 }
 
-void mqtt_client_publish_row(mqtt_client_t *m, uint64_t ts, const motor_row_t *row)
+size_t mqtt_client_format_row(char *buf, size_t buf_sz, uint64_t ts,
+                              const motor_row_t *row)
 {
-    char row_buf[512];
-    int len = snprintf(row_buf, sizeof(row_buf),
+    int len = snprintf(buf, buf_sz,
                       "%llu,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%u\n",
                       (unsigned long long)ts,
                       row->current[0], row->current[1], row->current[2], row->current[3],
                       row->current[4], row->current[5], row->current[6], row->current[7],
                       row->vib_x, row->vib_y, row->vib_z, row->rpm);
 
-    if (len > 0 && (size_t)len < sizeof(row_buf)) {
-        mosquitto_publish(m->mosq, NULL, DATA_TOPIC, len, row_buf, 0, false);
-    }
+    if (len <= 0 || (size_t)len >= buf_sz) return 0;
+    return (size_t)len;
+}
 
+/*
+ * One message, one or more rows.
+ *
+ * The rows are newline-terminated and the GUI splits on the newline, so a block
+ * of several is the same format as the single row this used to send -- a one-row
+ * block is byte-for-byte what it was. That is what lets the sample rate go up
+ * without the message rate following it: the live plot wants detail, the broker
+ * is ~145ms away and wants few round trips, and packing decouples the two.
+ */
+void mqtt_client_publish_rows(mqtt_client_t *m, const char *payload, size_t len,
+                              uint64_t ts)
+{
+    if (!payload || len == 0) return;
+    mosquitto_publish(m->mosq, NULL, DATA_TOPIC, (int)len, payload, 0, false);
     m->last_data_ts = ts;
+}
+
+void mqtt_client_publish_row(mqtt_client_t *m, uint64_t ts, const motor_row_t *row)
+{
+    char row_buf[512];
+    size_t len = mqtt_client_format_row(row_buf, sizeof(row_buf), ts, row);
+    if (len) mqtt_client_publish_rows(m, row_buf, len, ts);
 }
 
 void mqtt_client_publish_chunk(mqtt_client_t *m, int chunk_idx, int total_chunks,

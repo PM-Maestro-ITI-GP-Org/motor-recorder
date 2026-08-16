@@ -51,6 +51,17 @@ void mqtt_client_disconnect(mqtt_client_t *m);
 void mqtt_client_ensure_connected(mqtt_client_t *m);
 void mqtt_client_publish_status(mqtt_client_t *m, rec_state_t state, const char *msg);
 void mqtt_client_publish_row(mqtt_client_t *m, uint64_t ts, const motor_row_t *row);
+
+/* Format one data row, newline-terminated, in the wire format the GUI parses.
+   Returns bytes written, 0 if it would not fit. Split out from
+   publish_row() so several rows can be packed into one message. */
+size_t mqtt_client_format_row(char *buf, size_t buf_sz, uint64_t ts,
+                              const motor_row_t *row);
+
+/* Publish an already-formatted block of one or more rows to the data topic.
+   `ts` is the timestamp of the last row in the block. */
+void mqtt_client_publish_rows(mqtt_client_t *m, const char *payload, size_t len,
+                              uint64_t ts);
 void mqtt_client_publish_chunk(mqtt_client_t *m, int chunk_idx, int total_chunks,
                                const char *chunk_data, size_t chunk_len);
 void mqtt_client_publish_upload_progress(mqtt_client_t *m, int percent);

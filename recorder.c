@@ -331,23 +331,48 @@ static void *reader_thread(void *arg)
 }
 
 /*
- * How often a sample row is published for the GUI's live display.
+ * The live feed for the GUI's plot and telemetry tiles.
  *
- * The rows themselves arrive far faster than this -- the producer streams a
- * block at a time off SPI -- and every one of them still goes to the CSV. This
- * governs only the copy sent over MQTT, which exists to drive a panel a person
- * is looking at. Ten a second is past the point where a number on screen reads
- * as anything but a blur, and publishing every row instead would put thousands
- * of messages a second onto a broker roughly 145ms away.
+ * The rows themselves arrive far faster than any of this -- the producer streams
+ * a block at a time off SPI -- and every one of them still goes to the CSV.
+ * These govern only the copy sent over MQTT.
+ *
+ * Two separate rates, because they answer two different questions.
+ *
+ *   SAMPLE is how much detail the plot gets: how finely the trace is drawn.
+ *   SEND is how often the picture moves: how fluid the scroll looks.
+ *
+ * Both used to be 100ms, one row per message, and that is what made the live
+ * plot look coarse. At a 60s window and a plot ~600px wide, 10 samples a second
+ * is exactly one sample per pixel -- there was no detail to lose, and the trace
+ * crawled forward one pixel at a time, ten times a second.
+ *
+ * 20ms sampling with a 50ms send gives the plot five times the resolution and
+ * moves it twenty times a second instead of ten, while the message rate only
+ * doubles: each message now carries the two or three rows that accumulated
+ * since the last one. Packing is what keeps that affordable on a broker roughly
+ * 145ms away -- the alternative, publishing every sample on its own, is the
+ * thousands of messages a second the single-row form was avoiding.
  */
-#define LIVE_ROW_INTERVAL_MS 100
+#define LIVE_SAMPLE_INTERVAL_MS 20
+#define LIVE_SEND_INTERVAL_MS   50
+/* Headroom over the 3 rows a 50ms window holds at the 20ms sample rate, so a
+   scheduling hiccup packs the backlog instead of dropping it. */
+#define LIVE_ROWS_PER_MSG       8
 
 static void *writer_thread(void *arg)
 {
     pin_to_cpu(1);
     writer_t *w = (writer_t *)arg;
     struct row_buf buf = { .len = 0 };
-    uint64_t last_pub_ms = 0;
+    uint64_t last_sample_ms = 0;
+    uint64_t last_send_ms = 0;
+
+    /* Rows sampled but not yet sent, already in wire format. */
+    char live_buf[LIVE_ROWS_PER_MSG * 128];
+    size_t live_len = 0;
+    int live_rows = 0;
+    uint64_t live_last_ts = 0;
 
     while (g_running && g_recording && w->active) {
         csv_row_t cr;
@@ -360,7 +385,7 @@ static void *writer_thread(void *arg)
             }
 
             /*
-             * Publish a sample for the live display.
+             * Sample a row for the live display.
              *
              * mqtt_client_publish_row() existed, was declared in the header,
              * and was called from nowhere at all -- so the recorder wrote every
@@ -370,9 +395,24 @@ static void *writer_thread(void *arg)
              * is why the live panel sat at "---" throughout a recording.
              */
             uint64_t now = now_ms();
-            if (g_mqtt && now - last_pub_ms >= LIVE_ROW_INTERVAL_MS) {
-                last_pub_ms = now;
-                mqtt_client_publish_row(g_mqtt, cr.ts, &cr.row);
+            if (g_mqtt && now - last_sample_ms >= LIVE_SAMPLE_INTERVAL_MS
+                && live_rows < LIVE_ROWS_PER_MSG) {
+                size_t n = mqtt_client_format_row(live_buf + live_len,
+                                                  sizeof(live_buf) - live_len,
+                                                  cr.ts, &cr.row);
+                if (n) {
+                    last_sample_ms = now;
+                    live_len += n;
+                    live_rows++;
+                    live_last_ts = cr.ts;
+                }
+            }
+
+            if (g_mqtt && live_rows > 0 && now - last_send_ms >= LIVE_SEND_INTERVAL_MS) {
+                last_send_ms = now;
+                mqtt_client_publish_rows(g_mqtt, live_buf, live_len, live_last_ts);
+                live_len = 0;
+                live_rows = 0;
             }
 
             if (buf.len >= ROW_BUF_SIZE / 2)
@@ -380,10 +420,28 @@ static void *writer_thread(void *arg)
         } else {
             if (buf.len > 0)
                 row_buf_flush(w->csv_file, &buf);
+
+            /* The send above only runs when a row arrives, so during a lull
+               whatever was sampled would sit here until data resumed -- the
+               plot would stall a moment behind, exactly when the interesting
+               thing is that the data stopped. */
+            if (g_mqtt && live_rows > 0
+                && now_ms() - last_send_ms >= LIVE_SEND_INTERVAL_MS) {
+                last_send_ms = now_ms();
+                mqtt_client_publish_rows(g_mqtt, live_buf, live_len, live_last_ts);
+                live_len = 0;
+                live_rows = 0;
+            }
+
             struct timespec ts = {0, 1 * 1000 * 1000L};
             nanosleep(&ts, NULL);
         }
     }
+
+    /* Whatever was sampled but not yet sent, rather than losing the tail end of
+       the recording from the plot. */
+    if (g_mqtt && live_rows > 0)
+        mqtt_client_publish_rows(g_mqtt, live_buf, live_len, live_last_ts);
 
     if (buf.len > 0)
         row_buf_flush(w->csv_file, &buf);
