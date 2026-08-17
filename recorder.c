@@ -1398,7 +1398,17 @@ int main(int argc, char *argv[])
         }
     }
 
-    fprintf(stderr, "Motor Recorder — save dir: %s\n", g_save_dir);
+    /*
+     * When this binary was compiled, on its first line.
+     *
+     * "Is the target running the build I just made?" has been answered twice
+     * now by counting MQTT messages and reasoning backwards from the shape of
+     * the distribution. That works, but it is a poor way to find out a deploy
+     * did not land. __DATE__ and __TIME__ are fixed at compile time, so a stamp
+     * older than the last `make` says so outright.
+     */
+    fprintf(stderr, "Motor Recorder — built %s %s — save dir: %s\n",
+            __DATE__, __TIME__, g_save_dir);
 
     mqtt_client_t mqtt;
     if (mqtt_client_init(&mqtt, handle_command) != 0) {
