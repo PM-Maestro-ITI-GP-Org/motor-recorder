@@ -36,6 +36,7 @@ struct row_buf {
 
 typedef struct {
     uint64_t     ts;
+    uint32_t     seq;      /* producer frame seq this row belongs to */
     motor_row_t  row;
 } csv_row_t;
 
@@ -67,6 +68,11 @@ typedef struct reader_s {
     bool      first_seen;
     uint64_t  dropped;
     uint64_t  total_rows;
+    uint64_t  sample_ovr_blocks;   /* blocks flagged MOTOR_FLAG_SAMPLE_OVERRUN */
+    uint64_t  block_drop_blocks;   /* blocks flagged MOTOR_FLAG_BLOCK_DROPPED   */
+    uint64_t  seq_drops;           /* producer seq gaps (frames lost upstream) */
+    uint32_t  last_seq;
+    bool      have_last_seq;
     uint64_t  last_wp;
     uint64_t  stalled_ms;
 } reader_t;
@@ -86,7 +92,8 @@ static void stop_recording(void);
 static void queue_free(row_queue_t *q);
 static bool queue_push(row_queue_t *q, const csv_row_t *r);
 static bool queue_pop(row_queue_t *q, csv_row_t *r);
-static void row_buf_add(struct row_buf *b, uint64_t ts, const motor_row_t *row);
+static void row_buf_add(struct row_buf *b, uint64_t ts, uint32_t seq,
+                        const motor_row_t *row);
 static void row_buf_flush(FILE *f, struct row_buf *b);
 static void *reader_thread(void *arg);
 static void *writer_thread(void *arg);
@@ -260,14 +267,15 @@ static bool queue_pop(row_queue_t *q, csv_row_t *r)
 
 /* ======== Row buffer ======== */
 
-static void row_buf_add(struct row_buf *b, uint64_t ts, const motor_row_t *row)
+static void row_buf_add(struct row_buf *b, uint64_t ts, uint32_t seq,
+                        const motor_row_t *row)
 {
     int n = snprintf(b->data + b->len, sizeof(b->data) - b->len,
-                     "%llu,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%u\n",
+                     "%llu,%u,%u,%u,%u,%u,%u,%u,%u,%d,%d,%d,%u,%u\n",
                      (unsigned long long)ts,
                      row->current[0], row->current[1], row->current[2], row->current[3],
                      row->current[4], row->current[5], row->current[6], row->current[7],
-                     row->vib_x, row->vib_y, row->vib_z, row->rpm);
+                     row->vib_x, row->vib_y, row->vib_z, row->rpm, seq);
     if (n > 0) b->len += (size_t)n;
 }
 
@@ -293,6 +301,7 @@ static void *reader_thread(void *arg)
     reader_t *rd = (reader_t *)arg;
     rd->dropped = 0;
     rd->stalled_ms = 0;
+    rd->have_last_seq = false;
 
     while (g_running && g_recording && rd->active) {
         struct timespec ts = {0, POLL_TIMEOUT_MS * 1000 * 1000L};
@@ -312,6 +321,31 @@ static void *reader_thread(void *arg)
         }
         for (size_t i = 0; i < n; ++i) {
             rd->total_rows += blocks[i].n_rows;
+            if (blocks[i].flags & MOTOR_FLAG_SAMPLE_OVERRUN)
+                rd->sample_ovr_blocks++;
+            if (blocks[i].flags & MOTOR_FLAG_BLOCK_DROPPED)
+                rd->block_drop_blocks++;
+
+            /* Producer seq: count discontinuities between consecutive blocks
+             * that actually reached the ring. A gap here means a frame was
+             * lost somewhere between the STM32's assemble_frame and this ring
+             * slot (producer pool drop, SPI link loss, or ring overlap). A
+             * frame dropped by the STM32 acquisition never consumes a seq, so
+             * it shows up as a phase break with seq CONTINUOUS -- that is the
+             * distinction this counter exists to make. */
+            uint32_t s = blocks[i].producer_seq;
+            if (!rd->have_last_seq) {
+                rd->have_last_seq = true;
+            } else {
+                uint32_t diff = s - rd->last_seq;
+                if (diff == 0u) {
+                    /* duplicate seq (shouldn't happen on the ring) -- skip */
+                } else if (diff > 1u) {
+                    rd->seq_drops += (uint64_t)(diff - 1u);
+                }
+            }
+            rd->last_seq = s;
+
             for (uint16_t j = 0; j < blocks[i].n_rows; ++j) {
                 uint64_t ts = blocks[i].row_ts[j];
                 if (!rd->first_seen) {
@@ -319,7 +353,8 @@ static void *reader_thread(void *arg)
                     rd->first_seen = true;
                 }
                 rd->last_ts = ts;
-                csv_row_t cr = { .ts = ts, .row = blocks[i].rows[j] };
+                csv_row_t cr = { .ts = ts, .seq = blocks[i].producer_seq,
+                                 .row = blocks[i].rows[j] };
                 if (!queue_push(rd->queue, &cr))
                     rd->dropped++;
             }
@@ -377,7 +412,7 @@ static void *writer_thread(void *arg)
     while (g_running && g_recording && w->active) {
         csv_row_t cr;
         if (queue_pop(w->queue, &cr)) {
-            row_buf_add(&buf, cr.ts, &cr.row);
+            row_buf_add(&buf, cr.ts, cr.seq, &cr.row);
             if (w->rec_rows_ptr) {
                 pthread_mutex_lock(&g_rec_mutex);
                 (*w->rec_rows_ptr)++;
@@ -515,7 +550,7 @@ static FILE *open_csv(const char *path)
     if (!f) { perror("fopen"); return NULL; }
     fprintf(f, "timestamp,Current_0,Current_1,Current_2,Speed_volt_cmd,"
                "Volt_0,Volt_1,Volt_2,DC_bus_volt,"
-               "vib_x,vib_y,vib_z,rpm\n");
+               "vib_x,vib_y,vib_z,rpm,seq\n");
     return f;
 }
 
@@ -668,12 +703,15 @@ static void stop_recording(void)
     g_has_stop_data = true;
     recorder_cleanup();
 
-    fprintf(stderr, "[cmd] Recording stopped. Rows: %llu, Span: %llu us, Drops: %llu, BlockDrops: %llu, Stalled: %llu ms, File: %s\n",
+    fprintf(stderr, "[cmd] Recording stopped. Rows: %llu, Span: %llu us, Drops: %llu, BlockDrops: %llu, SeqDrops: %llu, Stalled: %llu ms, SampleOvr: %llu, BlockDrop: %llu, File: %s\n",
             (unsigned long long)g_stop_total_rows,
             (unsigned long long)g_stop_span_us,
             (unsigned long long)g_stop_drops,
             (unsigned long long)g_stop_block_drops,
+            g_rd ? (unsigned long long)g_rd->seq_drops : 0ULL,
             (unsigned long long)g_stop_stalled_ms,
+            g_rd ? (unsigned long long)g_rd->sample_ovr_blocks : 0ULL,
+            g_rd ? (unsigned long long)g_rd->block_drop_blocks : 0ULL,
             g_csv_filename);
 
     mqtt_client_publish_stop_metadata(g_mqtt, g_csv_filename, "",
