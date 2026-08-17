@@ -872,6 +872,73 @@ typedef struct {
     char path[1024];
 } upload_job_t;
 
+/*
+ * Progress is published by its own thread, on its own clock.
+ *
+ * The transfer loop used to publish as it went, which coupled two things that
+ * should not be coupled: how fast the bytes move and how often the GUI hears
+ * about it. fwrite() to ssh blocks once the far end stops draining, and that is
+ * normal on a link like this one -- but while it blocked, the loop was not
+ * reaching its publish call either, so the bar simply stopped. A stalled
+ * transfer and a dead recorder looked exactly alike from the GUI.
+ *
+ * Now the transfer loop makes no MQTT calls at all. It advances a counter, and
+ * this thread samples that counter on a timer and publishes. A stall shows up
+ * as the true thing it is -- a percentage that stays put while messages keep
+ * arriving -- and the transfer never waits on the broker.
+ */
+#define UPLOAD_PROGRESS_INTERVAL_MS 200
+/* Re-send an unchanged percentage this often, so silence always means broken
+   rather than merely slow. */
+#define UPLOAD_HEARTBEAT_MS         2000
+
+static _Atomic long long g_upload_sent  = 0;
+static _Atomic long long g_upload_total = 0;
+static volatile bool     g_upload_running = false;
+
+static void msleep(long ms)
+{
+    struct timespec ts = { ms / 1000, (ms % 1000) * 1000000L };
+    nanosleep(&ts, NULL);
+}
+
+static void *upload_progress_thread(void *arg)
+{
+    (void)arg;
+
+    int last_pct = -1;
+    uint64_t last_pub_ms = 0;
+
+    while (g_upload_running) {
+        const long long total = atomic_load(&g_upload_total);
+        const long long sent  = atomic_load(&g_upload_sent);
+
+        if (total > 0) {
+            int pct = (int)(sent * 100 / total);
+            /* 100 is published once, by the upload thread, and only after the
+               server has confirmed the size. Until then the most this can
+               honestly say is 99. */
+            if (pct > 99) pct = 99;
+
+            const uint64_t now = now_ms();
+            if (pct != last_pct || now - last_pub_ms >= UPLOAD_HEARTBEAT_MS) {
+                last_pct = pct;
+                last_pub_ms = now;
+                mqtt_client_publish_upload_progress(g_mqtt, pct);
+            }
+        }
+
+        /* Short sleeps rather than one long one, so stopping is prompt: the
+           upload thread joins this before it reports the result, and a 200ms
+           wait there would be 200ms of the GUI still being told "uploading"
+           after the transfer had finished. */
+        for (int i = 0; i < UPLOAD_PROGRESS_INTERVAL_MS / 20 && g_upload_running; i++)
+            msleep(20);
+    }
+
+    return NULL;
+}
+
 static void *upload_thread(void *arg)
 {
     upload_job_t *job = (upload_job_t *)arg;
@@ -1038,10 +1105,26 @@ static void *upload_thread(void *arg)
 
     mqtt_client_publish_upload_progress(g_mqtt, 0);
 
+    /* The reporter, started before the first byte moves and joined after the
+       last one does, so there is no window where the transfer is running and
+       nothing is reporting it. */
+    atomic_store(&g_upload_total, local_size);
+    atomic_store(&g_upload_sent, 0);
+    g_upload_running = true;
+
+    pthread_t prog_tid;
+    bool prog_started = (pthread_create(&prog_tid, NULL,
+                                        upload_progress_thread, NULL) == 0);
+    if (!prog_started) {
+        /* Not fatal: the transfer is the job, the bar is the commentary. */
+        g_upload_running = false;
+        fprintf(stderr, "[cmd] no progress thread; upload continues unreported\n");
+    }
+
     /*
      * 32K chunks, flushed.
      *
-     * The chunk size sets how finely the bar can move, and the flush is
+     * The chunk size sets how finely the counter moves, and the flush is
      * what makes `sent` mean "handed to ssh" rather than "sitting in
      * stdio's buffer": without it the count runs ahead in 64K steps as the
      * buffer fills and then stalls while it drains, so the bar advanced in
@@ -1049,11 +1132,12 @@ static void *upload_thread(void *arg)
      *
      * fwrite blocks here once ssh's own buffer is full, which is the
      * desired behaviour -- it paces this loop to the network instead of
-     * spinning.
+     * spinning. Nothing in this loop touches MQTT: it moves bytes and
+     * publishes the count, and upload_progress_thread turns that into
+     * messages on a clock of its own.
      */
     char xfer[32 * 1024];
     long long sent = 0;
-    int last_pct = 0;
     int write_failed = 0;
     size_t got;
 
@@ -1061,24 +1145,21 @@ static void *upload_thread(void *arg)
         if (fwrite(xfer, 1, got, sink) != got) { write_failed = 1; break; }
         fflush(sink);
         sent += (long long)got;
-
-        if (local_size > 0) {
-            /* Only when the whole percent changes. The payload carries an
-               integer percent, so the finer steps this used to publish were
-               ten identical messages per step -- a thousand QoS 0 publishes
-               per upload that the GUI could not distinguish from a hundred. */
-            int pct = (int)(sent * 100 / local_size);
-            if (pct > 99) pct = 99;   /* 100 is the completion publish below */
-            if (pct > last_pct) {
-                last_pct = pct;
-                mqtt_client_publish_upload_progress(g_mqtt, pct);
-            }
-        }
+        atomic_store(&g_upload_sent, sent);
     }
     if (ferror(src)) write_failed = 1;
 
     fclose(src);
     pclose(sink);   /* QNX pclose() is unreliable -- verified below instead */
+
+    /* Stopped here rather than at the end of the function: what follows is a
+       fresh ssh round trip to stat the remote file, and a reporter still
+       running through it would keep claiming "uploading" while the transfer is
+       in fact over and being verified. */
+    if (prog_started) {
+        g_upload_running = false;
+        pthread_join(prog_tid, NULL);
+    }
 
     /*
      * One remote stat, after the fact, to decide success.
